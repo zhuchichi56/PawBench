@@ -9,7 +9,9 @@ FROM ${BASE_IMAGE}
 ARG PAWBENCH_SOURCE_COMMIT=unknown
 LABEL org.opencontainers.image.revision=${PAWBENCH_SOURCE_COMMIT}
 
-# Only this runtime file changed after the locked base image was built.
+# Copy the runtime files changed after the locked base image was built.
 # Keep the full canonical Dockerfile as the clean-host rebuild authority.
 COPY pawbench/agents/impl/qwenpaw_agent.py \
      /opt/copawbench/pawbench/agents/impl/qwenpaw_agent.py
+COPY pawbench/utils/anomalies.py \
+     /opt/copawbench/pawbench/utils/anomalies.py
