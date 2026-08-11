@@ -24,6 +24,7 @@ _GATEWAY_PORT = 18789
 _OPENCLAW_PORTS = itertools.count(28088, 20)
 _OPENCLAW_SETUP_LIMIT_ENV = "PAWBENCH_OPENCLAW_SETUP_CONCURRENCY"
 _OPENCLAW_SETUP_LIMIT_DEFAULT = 8
+_OPENCLAW_CONTROL_TIMEOUT = 60
 _OPENCLAW_SETUP_SEMAPHORE: threading.BoundedSemaphore | None = None
 _OPENCLAW_SETUP_LOCK = threading.Lock()
 _OPENCLAW_SETUP_LIMIT: int | None = None
@@ -126,7 +127,7 @@ class OpenClawAgent(ContainerAgent):
     # ── installation ──────────────────────────────────────────────────────────
 
     async def install(self, environment: BaseEnvironment) -> None:
-        check = await environment.execute_command("command -v openclaw", timeout=10)
+        check = await environment.execute_command("command -v openclaw", timeout=_OPENCLAW_CONTROL_TIMEOUT)
         if check.get("returncode", 1) == 0 and check.get("stdout", "").strip():
             return
         await environment.execute_command(
@@ -164,7 +165,7 @@ class OpenClawAgent(ContainerAgent):
         await environment.execute_command(
             f"mkdir -p {AGENT_WORKSPACE}/output {AGENT_WORKSPACE}/sessions && "
             "mkdir -p /root/.openclaw/agents",
-            timeout=15,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
 
         # Wipe the auth profile baked into the image by ``openclaw onboard``
@@ -182,7 +183,7 @@ class OpenClawAgent(ContainerAgent):
             "rm -f /root/.openclaw/auth-profiles.json "
             "      /root/.openclaw/auth/profiles.json "
             "      /root/.openclaw/auth/*.json 2>/dev/null || true",
-            timeout=10,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
 
         model_identifier = self.config.get("model", "dashscope/qwen3.6-plus")
@@ -227,17 +228,15 @@ class OpenClawAgent(ContainerAgent):
             f"--model {shlex.quote(openclaw_model)} "
             f"--workspace {shlex.quote(AGENT_WORKSPACE)} "
             "--non-interactive",
-            timeout=300,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
         if add_result.get("returncode", 1) != 0:
-            import logging
-            logging.getLogger(__name__).error(
-                "openclaw agents add failed (exit %s) — agent=%s model=%s\nstdout: %s\nstderr: %s",
-                add_result.get("returncode"),
-                agent_id,
-                model_identifier,
-                (add_result.get("stdout") or "")[:500],
-                (add_result.get("stderr") or "")[:500],
+            raise RuntimeError(
+                "openclaw agents add failed "
+                f"(exit {add_result.get('returncode')}) — agent={agent_id} "
+                f"model={model_identifier} stdout="
+                f"{(add_result.get('stdout') or '')[:500]} stderr="
+                f"{(add_result.get('stderr') or '')[:500]}"
             )
 
         # ``openclaw agents add`` copies the image-baked auth-profiles.json
@@ -259,23 +258,17 @@ class OpenClawAgent(ContainerAgent):
         }, indent=2)
         await environment.execute_command(
             f"mkdir -p /root/.openclaw/agents/{agent_id_lower}/agent",
-            timeout=10,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
         await environment.write_file(
             f"/root/.openclaw/agents/{agent_id_lower}/agent/auth-profiles.json",
             auth_profiles_content,
         )
 
-        # Point openclaw's global default workspace at the benchmark path so
-        # the ACPX runtime routes all file I/O there.  ``agents add --workspace``
-        # only sets per-agent metadata; this config key controls where write/read
-        # operations actually land.
-        await environment.execute_command(
-            f"{env_prefix}"
-            f"openclaw config set agents.defaults.workspace {shlex.quote(AGENT_WORKSPACE)} "
-            "2>/dev/null || true",
-            timeout=15,
-        )
+        # The final JSON patch below writes agents.defaults.workspace
+        # directly. Avoid another OpenClaw CLI/plugin initialization here: under
+        # many live containers it can exceed short podman-exec deadlines even
+        # though the config mutation itself is trivial.
 
         # ``agents add`` rewrites openclaw.json and may drop fields like
         # ``gateway.mode``.  Patch them back so the gateway reads a fully
@@ -292,7 +285,7 @@ class OpenClawAgent(ContainerAgent):
         )
         await environment.execute_command(
             "python3 /tmp/patch_gateway_mode.py",
-            timeout=10,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
 
         # Re-apply provider/model config after ``agents add`` may have
@@ -323,7 +316,7 @@ class OpenClawAgent(ContainerAgent):
         # itself, not injected by the benchmark harness.
         await environment.execute_command(
             f"rm -f {shlex.quote(AGENT_WORKSPACE)}/BOOTSTRAP.md",
-            timeout=10,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
 
     # ── openclaw.json configuration ───────────────────────────────────────────
@@ -598,7 +591,7 @@ class OpenClawAgent(ContainerAgent):
                 )
             try:
                 await environment.execute_command(
-                    "rm -f /tmp/openclaw_gateway.pgid", timeout=5
+                    "rm -f /tmp/openclaw_gateway.pgid", timeout=_OPENCLAW_CONTROL_TIMEOUT
                 )
             except Exception:
                 pass
@@ -611,7 +604,7 @@ class OpenClawAgent(ContainerAgent):
             "  for i in $(seq 1 80); do kill -0 -- -\"$pgid\" 2>/dev/null || break; sleep 0.1; done; "
             "  kill -KILL -- -\"$pgid\" 2>/dev/null || true; "
             "fi; rm -f /tmp/openclaw_gateway.pgid",
-            timeout=15,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
         if result.get("returncode", 1) != 0:
             raise RuntimeError(f"gateway cleanup failed: {result}")
@@ -634,7 +627,7 @@ class OpenClawAgent(ContainerAgent):
             f"    except Exception: pass\n"
             "print('GATEWAY_READY' if ok else 'GATEWAY_NOT_READY')\""
         )
-        result = await environment.execute_command(wait_cmd, timeout=55)
+        result = await environment.execute_command(wait_cmd, timeout=_OPENCLAW_CONTROL_TIMEOUT)
         if result.get("returncode", 1) != 0 or "GATEWAY_READY" not in (
             result.get("stdout") or ""
         ):
@@ -659,7 +652,7 @@ class OpenClawAgent(ContainerAgent):
             "</dev/null >/tmp/openclaw_gateway.log 2>&1 & "
             "child=$!; echo $child >/tmp/openclaw_gateway.pgid; "
             "echo GATEWAY_LAUNCHED",
-            timeout=10,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
         if result.get("returncode", 1) != 0 or "GATEWAY_LAUNCHED" not in (
             result.get("stdout") or ""
@@ -908,6 +901,7 @@ class OpenClawAgent(ContainerAgent):
                 + f"gateway_cfg['port'] = {self._gateway_port}\n"
                 # ── agents.defaults ───────────────────────────────────────
                 + "agents_cfg = d.setdefault('agents', {}).setdefault('defaults', {})\n"
+                + f"agents_cfg['workspace'] = {json.dumps(AGENT_WORKSPACE)}\n"
                 f"agents_cfg['model'] = {{'primary': {json.dumps(primary)}}}\n"
                 f"agents_cfg.setdefault('models', {{}})[{json.dumps(primary)}] = "
                 f"  {json.dumps({'alias': model_name})}\n"
@@ -988,19 +982,19 @@ class OpenClawAgent(ContainerAgent):
             patch_result = await environment.execute_command(
                 self._make_key_env(provider_str, api_key)
                 + "python3 /tmp/patch_openclaw.py",
-                timeout=15,
+                timeout=_OPENCLAW_CONTROL_TIMEOUT,
             )
             if patch_result.get("returncode", 1) != 0:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "_configure_openclaw_json patch failed (exit %s):\n%s\n%s",
-                    patch_result.get("returncode"),
-                    (patch_result.get("stdout") or "")[:500],
-                    (patch_result.get("stderr") or "")[:500],
+                raise RuntimeError(
+                    "_configure_openclaw_json patch failed "
+                    f"(exit {patch_result.get('returncode')}): "
+                    f"{(patch_result.get('stdout') or '')[:500]} "
+                    f"{(patch_result.get('stderr') or '')[:500]}"
                 )
         except Exception:
             import logging
             logging.getLogger(__name__).exception("_configure_openclaw_json failed")
+            raise
 
     # ── gateway helpers ────────────────────────────────────────────────────────
 
@@ -1055,7 +1049,7 @@ class OpenClawAgent(ContainerAgent):
             "  except Exception: pass\n"
             '"'
         )
-        r = await environment.execute_command(tcp_check, timeout=5)
+        r = await environment.execute_command(tcp_check, timeout=_OPENCLAW_CONTROL_TIMEOUT)
         if "ALIVE" in (r.get("stdout") or ""):
             return
 
@@ -1159,7 +1153,7 @@ class OpenClawAgent(ContainerAgent):
         try:
             await environment.execute_command(
                 "python3 /tmp/wait_openclaw_session.py",
-                timeout=15,
+                timeout=_OPENCLAW_CONTROL_TIMEOUT,
             )
         except TimeoutError:
             # This poll is explicitly best-effort.  A slow container exec must
@@ -1189,7 +1183,7 @@ class OpenClawAgent(ContainerAgent):
             f"/root/.openclaw/agents/{agent_id_lower}/sessions/*.jsonl.lock "
             f"/root/.openclaw/agents/{agent_id_lower}/sessions/sessions.json "
             "2>/dev/null || true",
-            timeout=15,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
 
         # Re-check gateway liveness before each task (it may have crashed).
@@ -1203,7 +1197,7 @@ class OpenClawAgent(ContainerAgent):
         check_result = await environment.execute_command(
             f"test -f /root/.openclaw/agents/{agent_id_lower}/agent/auth-profiles.json "
             f"&& echo {shlex.quote(agent_id)} || true",
-            timeout=10,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
         check_output = (check_result.get("stdout") or "") + (check_result.get("stderr") or "")
         if agent_id.lower() not in check_output.lower():
@@ -1248,7 +1242,7 @@ class OpenClawAgent(ContainerAgent):
             )
             await environment.execute_command(
                 "python3 /tmp/patch_gateway_mode.py",
-                timeout=10,
+                timeout=_OPENCLAW_CONTROL_TIMEOUT,
             )
             base_url = self.config.get("base_url") or model_config.base_url or ""
             await self._configure_openclaw_json(
@@ -1327,7 +1321,7 @@ class OpenClawAgent(ContainerAgent):
             '  case "$f" in *.trajectory.jsonl) continue;; esac; '
             f'  cp "$f" "{AGENT_WORKSPACE}/sessions/"; '
             "done",
-            timeout=15,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
 
         await self._sync_workspace_to_output(environment, AGENT_WORKSPACE)
@@ -1489,7 +1483,7 @@ for src_dir in /root/.openclaw/workspace ~/.openclaw/workspace; do
   done
 done
 """
-        await environment.execute_command(_SYNC_CMD, timeout=30)
+        await environment.execute_command(_SYNC_CMD, timeout=_OPENCLAW_CONTROL_TIMEOUT)
 
     async def teardown(self, environment: BaseEnvironment) -> None:
         agent_id = self._agent_id()
@@ -1499,7 +1493,7 @@ done
         await self._kill_gateway(environment)
         await environment.execute_command(
             "rm -f /tmp/openclaw_output.txt /tmp/patch_openclaw.py",
-            timeout=10,
+            timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
 
     @property

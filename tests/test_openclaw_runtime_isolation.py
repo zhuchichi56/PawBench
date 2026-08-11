@@ -88,6 +88,76 @@ def test_setup_limiter_rejects_invalid_values(monkeypatch, value):
         asyncio.run(exercise())
 
 
+
+def test_openclaw_control_commands_use_contention_safe_deadline():
+    sources = "".join(
+        inspect.getsource(method)
+        for method in (
+            OpenClawAgent.install,
+            OpenClawAgent._setup_limited,
+            OpenClawAgent._start_gateway,
+            OpenClawAgent._configure_openclaw_json,
+            OpenClawAgent.run,
+            OpenClawAgent.post_run_collect,
+            OpenClawAgent.teardown,
+        )
+    )
+    for short in ("timeout=5", "timeout=10", "timeout=15", "timeout=30"):
+        assert short not in sources
+    assert "_OPENCLAW_CONTROL_TIMEOUT" in sources
+    assert "openclaw config set agents.defaults.workspace" not in sources
+    assert "agents_cfg['workspace']" in inspect.getsource(
+        OpenClawAgent._configure_openclaw_json
+    )
+
+
+
+def test_openclaw_control_timeout_names_resolve():
+    import ast
+    from pathlib import Path
+
+    source = Path(openclaw_agent.__file__).read_text()
+    tree = ast.parse(source)
+    assigned = {
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    referenced = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id.startswith("_OPENCLAW_CONTROL_TIMEOUT")
+    }
+    assert referenced == {"_OPENCLAW_CONTROL_TIMEOUT"}
+    assert referenced <= assigned
+
+def test_configure_openclaw_failure_is_fatal():
+    agent = OpenClawAgent(
+        model="custom/Qwen3.5-4B",
+        api_key="EMPTY",
+        base_url="http://127.0.0.1:30000/v1",
+    )
+
+    class Environment:
+        async def write_file(self, path, content):
+            return True
+
+        async def execute_command(self, command, timeout=None):
+            return {"returncode": 1, "stdout": "", "stderr": "broken config"}
+
+    with pytest.raises(RuntimeError, match="patch failed"):
+        asyncio.run(
+            agent._configure_openclaw_json(
+                Environment(),
+                api_key="EMPTY",
+                base_url="http://127.0.0.1:30000/v1",
+                model_identifier="custom/Qwen3.5-4B",
+                explicit_base_url=True,
+            )
+        )
+
 def test_session_flush_timeout_is_best_effort(monkeypatch):
     agent = OpenClawAgent(model="custom/Qwen3.5-4B")
 
