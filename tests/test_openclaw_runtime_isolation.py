@@ -117,11 +117,73 @@ def test_nested_gateway_uses_owned_process_group_without_broad_kill():
     setup_source = inspect.getsource(OpenClawAgent._start_gateway)
     cleanup_source = inspect.getsource(OpenClawAgent._kill_gateway)
     nested_cleanup_source = inspect.getsource(OpenClawAgent._kill_nested_gateway)
+    signal_source = inspect.getsource(OpenClawAgent._signal_owned_gateway_members)
 
     assert "setsid" in setup_source
     assert "_gateway_group_for_port" in setup_source
-    assert "os.killpg" in nested_cleanup_source
-    assert "pkill" not in setup_source + cleanup_source + nested_cleanup_source
+    assert "pidfd_open" in signal_source
+    assert "pidfd_send_signal" in signal_source
+    all_cleanup_source = setup_source + cleanup_source + nested_cleanup_source + signal_source
+    assert "os.killpg(" not in all_cleanup_source
+    assert "pkill" not in all_cleanup_source
+
+
+def test_nested_gateway_cleanup_escalates_owned_helper_process(monkeypatch):
+    import os
+    import signal
+
+    pgid = 42420
+    uid = os.getuid()
+    owner_token = (12345, "0::/libpod-owned.scope")
+    initial = [(pgid, uid, "openclaw gateway"), (pgid + 1, uid, "npm install deps")]
+    helper = [(pgid + 1, uid, "npm install deps")]
+    snapshots = iter([initial, helper, []])
+
+    agent = OpenClawAgent(model="custom/Qwen3.5-4B")
+    agent._gateway_pgid = pgid
+    agent._gateway_owner_token = owner_token
+    monkeypatch.setenv("PAWBENCH_PODMAN_NESTED", "1")
+    monkeypatch.setattr(agent, "_port_is_open", lambda _port: False)
+    monkeypatch.setattr(agent, "_process_group_members", lambda _pgid: next(snapshots))
+    monkeypatch.setattr(
+        OpenClawAgent,
+        "_process_owner_token",
+        staticmethod(lambda _pid: owner_token),
+    )
+    monkeypatch.setattr(os, "getsid", lambda _pid: pgid)
+
+    wait_results = iter([False, True])
+
+    async def fake_wait(_pgid, _timeout):
+        return next(wait_results)
+
+    monkeypatch.setattr(agent, "_wait_nested_gateway_closed", fake_wait)
+
+    opened = []
+    closed = []
+    sent = []
+    monkeypatch.setattr(os, "pidfd_open", lambda pid: opened.append(pid) or pid + 1000)
+    monkeypatch.setattr(os, "close", lambda pidfd: closed.append(pidfd))
+    monkeypatch.setattr(
+        signal,
+        "pidfd_send_signal",
+        lambda pidfd, sig: sent.append((pidfd, sig)),
+    )
+
+    class Environment:
+        async def execute_command(self, command, timeout=None):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    asyncio.run(agent._kill_gateway(Environment()))
+    assert opened == [pgid, pgid + 1, pgid + 1]
+    assert closed == [pgid + 1000, pgid + 1001, pgid + 1001]
+    assert sent == [
+        (pgid + 1000, signal.SIGTERM),
+        (pgid + 1001, signal.SIGTERM),
+        (pgid + 1001, signal.SIGKILL),
+    ]
+    assert agent._gateway_pgid is None
+    assert agent._gateway_owner_token is None
 
 
 def test_nested_gateway_group_cleanup_is_exact(monkeypatch):
@@ -141,6 +203,7 @@ def test_nested_gateway_group_cleanup_is_exact(monkeypatch):
             time.sleep(0.01)
         agent = OpenClawAgent(model="custom/Qwen3.5-4B")
         agent._gateway_pgid = process.pid
+        agent._gateway_owner_token = agent._process_owner_token(process.pid)
         monkeypatch.setenv("PAWBENCH_PODMAN_NESTED", "1")
         monkeypatch.setattr(agent, "_port_is_open", lambda _port: False)
 

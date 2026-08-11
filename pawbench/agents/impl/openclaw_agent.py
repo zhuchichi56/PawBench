@@ -69,6 +69,7 @@ class OpenClawAgent(ContainerAgent):
         super().__init__(name, **kwargs)
         self._gateway_port = next(_OPENCLAW_PORTS)
         self._gateway_pgid: int | None = None
+        self._gateway_owner_token: tuple[int, str] | None = None
 
     def _agent_id(self) -> str:
         """Return a task-unique, filesystem-safe OpenClaw agent ID."""
@@ -385,6 +386,16 @@ class OpenClawAgent(ContainerAgent):
         return members
 
     @staticmethod
+    def _process_owner_token(pid: int) -> tuple[int, str] | None:
+        """Return the container/process-namespace identity for one host PID."""
+        try:
+            pid_namespace = os.stat(f"/proc/{pid}/ns/pid").st_ino
+            cgroup = open(f"/proc/{pid}/cgroup", encoding="utf-8").read().strip()
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            return None
+        return pid_namespace, cgroup
+
+    @staticmethod
     def _port_is_open(port: int) -> bool:
         with socket.socket() as sock:
             sock.settimeout(0.2)
@@ -454,35 +465,120 @@ class OpenClawAgent(ContainerAgent):
             self._gateway_port
         )
 
-    async def _kill_nested_gateway(self, pgid: int) -> None:
-        members = self._process_group_members(pgid)
-        bad = [
-            item
-            for item in members
-            if item[1] != os.getuid() or "openclaw" not in item[2].lower()
-        ]
+    @staticmethod
+    def _validate_owned_gateway_group(
+        pgid: int,
+        members: list[tuple[int, int, str]],
+        *,
+        require_openclaw: bool,
+        owner_token: tuple[int, str] | None,
+    ) -> None:
+        """Prove that every process still belongs to this task's gateway session.
+
+        OpenClaw may spawn helper commands such as ``npm install`` inside the
+        gateway process group. Requiring every command line to contain
+        ``openclaw`` therefore rejects legitimate children and leaves the
+        listener alive. The gateway is launched with ``setsid``, so its session
+        ID equals the recorded process-group ID; same-user membership in that
+        session is the stable ownership boundary even when child argv changes.
+        """
+        bad: list[tuple[int, int, str]] = []
+        for item in members:
+            pid, uid, _cmd = item
+            try:
+                sid = os.getsid(pid)
+            except ProcessLookupError:
+                continue
+            token = OpenClawAgent._process_owner_token(pid)
+            if (
+                uid != os.getuid()
+                or sid != pgid
+                or owner_token is None
+                or token != owner_token
+            ):
+                bad.append(item)
         if bad:
             raise RuntimeError(f"refusing to signal unowned gateway group {pgid}: {bad}")
-        if members:
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            if not await self._wait_nested_gateway_closed(pgid, 8):
-                members = self._process_group_members(pgid)
-                bad = [
-                    item
-                    for item in members
-                    if item[1] != os.getuid() or "openclaw" not in item[2].lower()
-                ]
-                if bad:
-                    raise RuntimeError(
-                        f"gateway group {pgid} changed before escalation: {bad}"
-                    )
+        if require_openclaw and members and not any(
+            "openclaw" in item[2].lower() for item in members
+        ):
+            raise RuntimeError(
+                f"refusing to signal gateway group {pgid} without an OpenClaw member: "
+                f"{members}"
+            )
+
+    @classmethod
+    def _signal_owned_gateway_members(
+        cls,
+        pgid: int,
+        members: list[tuple[int, int, str]],
+        sig: signal.Signals,
+        *,
+        require_openclaw: bool,
+        owner_token: tuple[int, str] | None,
+    ) -> None:
+        """Signal exact process identities without a killpg PID-reuse race."""
+        cls._validate_owned_gateway_group(
+            pgid,
+            members,
+            require_openclaw=require_openclaw,
+            owner_token=owner_token,
+        )
+        pidfds: list[int] = []
+        try:
+            for pid, _uid, _cmd in members:
                 try:
-                    os.killpg(pgid, signal.SIGKILL)
+                    pidfd = os.pidfd_open(pid)
+                except ProcessLookupError:
+                    continue
+                try:
+                    sid = os.getsid(pid)
+                    token = cls._process_owner_token(pid)
+                except ProcessLookupError:
+                    os.close(pidfd)
+                    continue
+                if sid != pgid or token != owner_token:
+                    os.close(pidfd)
+                    raise RuntimeError(
+                        f"gateway member changed before signal: pgid={pgid} pid={pid}"
+                    )
+                pidfds.append(pidfd)
+            for pidfd in pidfds:
+                try:
+                    signal.pidfd_send_signal(pidfd, sig)
                 except ProcessLookupError:
                     pass
+        finally:
+            for pidfd in pidfds:
+                os.close(pidfd)
+
+    async def _kill_nested_gateway(self, pgid: int) -> None:
+        members = self._process_group_members(pgid)
+        owner_token = self._gateway_owner_token
+        if members:
+            self._signal_owned_gateway_members(
+                pgid,
+                members,
+                signal.SIGTERM,
+                require_openclaw=True,
+                owner_token=owner_token,
+            )
+            if not await self._wait_nested_gateway_closed(pgid, 8):
+                # The OpenClaw parent may have exited after SIGTERM while an
+                # npm/plugin helper remains. Signal only pidfd-pinned members
+                # that retain the recorded task namespace and cgroup identity.
+                for _ in range(3):
+                    members = self._process_group_members(pgid)
+                    if not members:
+                        break
+                    self._signal_owned_gateway_members(
+                        pgid,
+                        members,
+                        signal.SIGKILL,
+                        require_openclaw=False,
+                        owner_token=owner_token,
+                    )
+                    await asyncio.sleep(0.1)
         if not await self._wait_nested_gateway_closed(pgid, 5):
             raise RuntimeError(
                 f"gateway cleanup incomplete: pgid={pgid} port={self._gateway_port} "
@@ -495,6 +591,7 @@ class OpenClawAgent(ContainerAgent):
             if self._gateway_pgid is not None:
                 await self._kill_nested_gateway(self._gateway_pgid)
                 self._gateway_pgid = None
+                self._gateway_owner_token = None
             elif self._port_is_open(self._gateway_port):
                 raise RuntimeError(
                     f"gateway port {self._gateway_port} is occupied without an owned process group"
@@ -580,6 +677,19 @@ class OpenClawAgent(ContainerAgent):
                 raise RuntimeError(
                     f"could not resolve gateway process group for port {self._gateway_port}"
                 )
+            members = self._process_group_members(self._gateway_pgid)
+            tokens = {
+                token
+                for item in members
+                if "openclaw" in item[2].lower()
+                if (token := self._process_owner_token(item[0])) is not None
+            }
+            if len(tokens) != 1:
+                raise RuntimeError(
+                    f"could not establish one gateway owner token: pgid="
+                    f"{self._gateway_pgid} members={members} tokens={tokens}"
+                )
+            self._gateway_owner_token = next(iter(tokens))
 
         await self._wait_gateway_ready(environment, port=self._gateway_port)
 
