@@ -2,6 +2,7 @@
 """Docker environment implementation for OpenJudge agent evaluation framework."""
 
 import asyncio
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -49,6 +50,11 @@ class DockerEnvironment(BaseEnvironment):
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
 
         cmd = ["docker", "run", "-d", "--name", self.name]
+        # Nested rootless Podman cannot mount a private procfs or create slirp
+        # networking on these AMLT nodes.  Host PID/network namespaces are the
+        # verified compatibility route; harness agents use per-task ports/PIDs.
+        if os.environ.get("PAWBENCH_PODMAN_NESTED") == "1":
+            cmd.extend(["--network", "host", "--pid", "host"])
 
         # Add volume mounts
         for host_path, container_path in self.volumes.items():
@@ -82,10 +88,49 @@ class DockerEnvironment(BaseEnvironment):
         """
         if not self.container_id:
             return
-        # Short grace period so a frozen container doesn't stall cleanup.
-        subprocess.run(["docker", "stop", "-t", "5", self.name], capture_output=True)
-        # Force-remove regardless of whether stop succeeded.
-        subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
+        # Bound both cleanup calls.  Nested rootless Podman can otherwise wait
+        # forever after a shared-PID-namespace container has already exited.
+        try:
+            subprocess.run(
+                ["docker", "stop", "-t", "5", self.name],
+                capture_output=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", self.name],
+                capture_output=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+
+        # Rootless Podman 3.4 can leave a fully stopped shared-PID container in
+        # the transient removing state after rm times out. Its exact cleanup
+        # command clears only that container's stale runtime/storage record;
+        # never use a system-wide prune/reset here.
+        try:
+            subprocess.run(
+                ["docker", "container", "cleanup", "--rm", self.name],
+                capture_output=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            exists = subprocess.run(
+                ["docker", "container", "exists", self.name],
+                capture_output=True,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Timed out verifying container cleanup: {self.name}"
+            ) from exc
+        if exists.returncode == 0:
+            raise RuntimeError(f"Container cleanup incomplete: {self.name}")
         self._is_running = False
         self.container_id = None
 

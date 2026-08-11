@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """OpenClaw agent implementation for pawbench evaluation."""
 
+import asyncio
+import itertools
 import json
 import os
 import shlex
+import signal
+import socket
 import time
 from typing import Any, Dict, List
 
@@ -14,6 +18,40 @@ from pawbench.llm.model_config import get_model_config, ProviderType
 
 
 _GATEWAY_PORT = 18789
+# OpenClaw also opens auxiliary listeners near the configured gateway port
+# (for example browser control at gateway+2). Keep task port bundles disjoint.
+_OPENCLAW_PORTS = itertools.count(28088, 20)
+_OPENCLAW_SETUP_LIMIT_ENV = "PAWBENCH_OPENCLAW_SETUP_CONCURRENCY"
+_OPENCLAW_SETUP_LIMIT_DEFAULT = 8
+_OPENCLAW_SETUP_SEMAPHORE: asyncio.Semaphore | None = None
+_OPENCLAW_SETUP_LOOP: asyncio.AbstractEventLoop | None = None
+_OPENCLAW_SETUP_LIMIT: int | None = None
+
+
+def _get_openclaw_setup_semaphore() -> asyncio.Semaphore:
+    """Return the process-local limiter for container and gateway setup only."""
+    global _OPENCLAW_SETUP_LIMIT, _OPENCLAW_SETUP_LOOP, _OPENCLAW_SETUP_SEMAPHORE
+
+    raw_limit = os.environ.get(
+        _OPENCLAW_SETUP_LIMIT_ENV, str(_OPENCLAW_SETUP_LIMIT_DEFAULT)
+    )
+    try:
+        limit = int(raw_limit)
+    except ValueError as exc:
+        raise ValueError(f"{_OPENCLAW_SETUP_LIMIT_ENV} must be an integer") from exc
+    if limit < 1:
+        raise ValueError(f"{_OPENCLAW_SETUP_LIMIT_ENV} must be positive")
+
+    loop = asyncio.get_running_loop()
+    if (
+        _OPENCLAW_SETUP_SEMAPHORE is None
+        or _OPENCLAW_SETUP_LOOP is not loop
+        or _OPENCLAW_SETUP_LIMIT != limit
+    ):
+        _OPENCLAW_SETUP_SEMAPHORE = asyncio.Semaphore(limit)
+        _OPENCLAW_SETUP_LOOP = loop
+        _OPENCLAW_SETUP_LIMIT = limit
+    return _OPENCLAW_SETUP_SEMAPHORE
 
 
 class OpenClawAgent(ContainerAgent):
@@ -26,12 +64,14 @@ class OpenClawAgent(ContainerAgent):
 
     def __init__(self, name: str = "openclaw", **kwargs: Any):
         super().__init__(name, **kwargs)
+        self._gateway_port = next(_OPENCLAW_PORTS)
+        self._gateway_pgid: int | None = None
 
     def _agent_id(self) -> str:
-        """Return a stable, filesystem-safe openclaw agent ID for this run."""
+        """Return a task-unique, filesystem-safe OpenClaw agent ID."""
         model = self.config.get("model", "dashscope/qwen3.6-plus")
-        slug = model.replace("/", "-").replace(".", "-").lower()
-        return f"bench-{slug}"
+        slug = model.replace("/", "-").replace(".", "-").lower()[:36]
+        return f"bench-{slug}-{self._gateway_port}"
 
     def _openclaw_model_id(self, model_identifier: str) -> str:
         """Translate a pawbench model identifier to an openclaw model identifier.
@@ -100,6 +140,13 @@ class OpenClawAgent(ContainerAgent):
     # ── setup ─────────────────────────────────────────────────────────────────
 
     async def setup(self, environment: BaseEnvironment) -> None:
+        # Limit only environment/CLI/gateway initialization.  The permit is
+        # released before run(), so ready tasks and model requests retain the
+        # benchmark's full harness queue width.
+        async with _get_openclaw_setup_semaphore():
+            await self._setup_limited(environment)
+
+    async def _setup_limited(self, environment: BaseEnvironment) -> None:
         await self.install(environment)
 
         # Create workspace and openclaw state directories.
@@ -158,21 +205,13 @@ class OpenClawAgent(ContainerAgent):
         # config writes; start exactly once after all patches are on disk.
         await self._kill_gateway(environment)
 
-        # Create (or recreate) the named bench agent so its workspace and
-        # model are explicitly bound.  Deleting first guarantees no stale
-        # config from a previous run leaks into the new task.
+        # Each benchmark attempt owns an ephemeral container plus a unique
+        # agent/config identity.  There is therefore no stale agent to delete;
+        # invoking ``agents delete`` in a fresh container can block behind
+        # OpenClaw plugin initialization and caused queue-wide setup timeouts.
         agent_id = self._agent_id()
         openclaw_model = self._openclaw_model_id(model_identifier)
         env_prefix = self._make_key_env(provider_str, api_key)
-        # NOTE: The first openclaw CLI invocation in a fresh container installs
-        # all plugin runtime dependencies (can take 60-120 s on slow networks).
-        # Timeouts here must exceed that warm-up cost; subsequent invocations
-        # reuse the cached deps and complete in < 1 s.
-        await environment.execute_command(
-            f"{env_prefix}"
-            f"openclaw agents delete {shlex.quote(agent_id)} --force 2>/dev/null || true",
-            timeout=300,
-        )
         add_result = await environment.execute_command(
             f"{env_prefix}"
             f"openclaw agents add {shlex.quote(agent_id)} "
@@ -209,6 +248,10 @@ class OpenClawAgent(ContainerAgent):
                 }
             },
         }, indent=2)
+        await environment.execute_command(
+            f"mkdir -p /root/.openclaw/agents/{agent_id_lower}/agent",
+            timeout=10,
+        )
         await environment.write_file(
             f"/root/.openclaw/agents/{agent_id_lower}/agent/auth-profiles.json",
             auth_profiles_content,
@@ -234,6 +277,7 @@ class OpenClawAgent(ContainerAgent):
             "p = '/root/.openclaw/openclaw.json'\n"
             "d = json.load(open(p)) if os.path.exists(p) else {}\n"
             "d.setdefault('gateway', {})['mode'] = 'local'\n"
+            f"d['gateway']['port'] = {self._gateway_port}\n"
             "json.dump(d, open(p, 'w'), indent=2)\n"
             "print('gateway.mode ensured')\n",
         )
@@ -308,19 +352,170 @@ class OpenClawAgent(ContainerAgent):
         env_vars = self._PROVIDER_CLI_ENVS.get(provider_str, ["OPENAI_API_KEY"])
         return " && ".join(f"export {v}={shlex.quote(api_key)}" for v in env_vars) + " && "
 
-    async def _kill_gateway(self, environment: BaseEnvironment) -> None:
-        """Stop any gateway process so config writes do not trigger hot-reload races."""
-        await environment.execute_command(
-            "kill -9 $(cat /tmp/openclaw_gateway.pid 2>/dev/null) 2>/dev/null || true; "
-            "pkill -9 -f 'openclaw gateway' 2>/dev/null || true; "
-            "pkill -9 -f 'openclaw-gateway' 2>/dev/null || true; "
-            "sleep 0.5; true",
-            timeout=10,
+    @staticmethod
+    def _process_group_members(pgid: int) -> list[tuple[int, int, str]]:
+        """Return (pid, uid, cmdline) for one host-visible process group."""
+        members: list[tuple[int, int, str]] = []
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = open(f"/proc/{entry.name}/stat", encoding="utf-8").read()
+                fields = raw[raw.rfind(")") + 2 :].split()
+                if fields[0] == "Z" or int(fields[2]) != pgid:  # state, ppid, pgrp
+                    continue
+                uid = os.stat(f"/proc/{entry.name}").st_uid
+                cmd = (
+                    open(f"/proc/{entry.name}/cmdline", "rb")
+                    .read()
+                    .replace(b"\0", b" ")
+                    .decode(errors="replace")
+                )
+                members.append((int(entry.name), uid, cmd))
+            except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+                continue
+        return members
+
+    @staticmethod
+    def _port_is_open(port: int) -> bool:
+        with socket.socket() as sock:
+            sock.settimeout(0.2)
+            return sock.connect_ex(("127.0.0.1", port)) == 0
+
+    @classmethod
+    def _gateway_group_for_port(cls, port: int) -> int | None:
+        """Resolve the host PID group that owns one OpenClaw listener."""
+        inodes: set[str] = set()
+        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                lines = open(table, encoding="utf-8").read().splitlines()[1:]
+            except (FileNotFoundError, PermissionError):
+                continue
+            for line in lines:
+                fields = line.split()
+                try:
+                    local_port = int(fields[1].rsplit(":", 1)[1], 16)
+                except (IndexError, ValueError):
+                    continue
+                if local_port == port and fields[3] == "0A":
+                    inodes.add(fields[9])
+        if not inodes:
+            return None
+
+        groups: set[int] = set()
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                if os.stat(f"/proc/{entry.name}").st_uid != os.getuid():
+                    continue
+                fd_dir = f"/proc/{entry.name}/fd"
+                owns_listener = any(
+                    os.readlink(fd.path) in {f"socket:[{inode}]" for inode in inodes}
+                    for fd in os.scandir(fd_dir)
+                )
+                if not owns_listener:
+                    continue
+                cmd = (
+                    open(f"/proc/{entry.name}/cmdline", "rb")
+                    .read()
+                    .replace(b"\0", b" ")
+                    .decode(errors="replace")
+                )
+                if "openclaw" not in cmd.lower():
+                    continue
+                raw = open(f"/proc/{entry.name}/stat", encoding="utf-8").read()
+                groups.add(int(raw[raw.rfind(")") + 2 :].split()[2]))
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError):
+                continue
+        if len(groups) > 1:
+            raise RuntimeError(
+                f"multiple OpenClaw process groups own gateway port {port}: {sorted(groups)}"
+            )
+        return next(iter(groups)) if groups else None
+
+    async def _wait_nested_gateway_closed(self, pgid: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._process_group_members(pgid) and not self._port_is_open(
+                self._gateway_port
+            ):
+                return True
+            await asyncio.sleep(0.1)
+        return not self._process_group_members(pgid) and not self._port_is_open(
+            self._gateway_port
         )
 
+    async def _kill_nested_gateway(self, pgid: int) -> None:
+        members = self._process_group_members(pgid)
+        bad = [
+            item
+            for item in members
+            if item[1] != os.getuid() or "openclaw" not in item[2].lower()
+        ]
+        if bad:
+            raise RuntimeError(f"refusing to signal unowned gateway group {pgid}: {bad}")
+        if members:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            if not await self._wait_nested_gateway_closed(pgid, 8):
+                members = self._process_group_members(pgid)
+                bad = [
+                    item
+                    for item in members
+                    if item[1] != os.getuid() or "openclaw" not in item[2].lower()
+                ]
+                if bad:
+                    raise RuntimeError(
+                        f"gateway group {pgid} changed before escalation: {bad}"
+                    )
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        if not await self._wait_nested_gateway_closed(pgid, 5):
+            raise RuntimeError(
+                f"gateway cleanup incomplete: pgid={pgid} port={self._gateway_port} "
+                f"members={self._process_group_members(pgid)}"
+            )
+
+    async def _kill_gateway(self, environment: BaseEnvironment) -> None:
+        """Stop exactly this task's gateway and prove its listener is closed."""
+        if os.environ.get("PAWBENCH_PODMAN_NESTED") == "1":
+            if self._gateway_pgid is not None:
+                await self._kill_nested_gateway(self._gateway_pgid)
+                self._gateway_pgid = None
+            elif self._port_is_open(self._gateway_port):
+                raise RuntimeError(
+                    f"gateway port {self._gateway_port} is occupied without an owned process group"
+                )
+            try:
+                await environment.execute_command(
+                    "rm -f /tmp/openclaw_gateway.pgid", timeout=5
+                )
+            except Exception:
+                pass
+            return
+
+        result = await environment.execute_command(
+            "pgid=$(cat /tmp/openclaw_gateway.pgid 2>/dev/null || true); "
+            "if [ -n \"$pgid\" ]; then "
+            "  kill -TERM -- -\"$pgid\" 2>/dev/null || true; "
+            "  for i in $(seq 1 80); do kill -0 -- -\"$pgid\" 2>/dev/null || break; sleep 0.1; done; "
+            "  kill -KILL -- -\"$pgid\" 2>/dev/null || true; "
+            "fi; rm -f /tmp/openclaw_gateway.pgid",
+            timeout=15,
+        )
+        if result.get("returncode", 1) != 0:
+            raise RuntimeError(f"gateway cleanup failed: {result}")
+        self._gateway_pgid = None
+
     async def _wait_gateway_ready(
-        self, environment: BaseEnvironment, *, port: int = _GATEWAY_PORT
+        self, environment: BaseEnvironment, *, port: int | None = None
     ) -> None:
+        port = self._gateway_port if port is None else port
         wait_cmd = (
             f'python3 -c "'
             "import socket, time; "
@@ -334,7 +529,11 @@ class OpenClawAgent(ContainerAgent):
             f"    except Exception: pass\n"
             "print('GATEWAY_READY' if ok else 'GATEWAY_NOT_READY')\""
         )
-        await environment.execute_command(wait_cmd, timeout=55)
+        result = await environment.execute_command(wait_cmd, timeout=55)
+        if result.get("returncode", 1) != 0 or "GATEWAY_READY" not in (
+            result.get("stdout") or ""
+        ):
+            raise RuntimeError(f"gateway did not become ready on port {port}: {result}")
 
     async def _start_gateway(
         self,
@@ -343,14 +542,38 @@ class OpenClawAgent(ContainerAgent):
         api_key: str,
         provider_str: str,
     ) -> None:
-        await environment.execute_command(
+        if self._gateway_pgid is not None or self._port_is_open(self._gateway_port):
+            raise RuntimeError(
+                f"gateway start requires a closed owned port: {self._gateway_port}"
+            )
+        result = await environment.execute_command(
             self._make_key_env(provider_str, api_key)
             + "export OPENCLAW_DISABLE_BONJOUR=1 && "
-            "nohup openclaw gateway >/tmp/openclaw_gateway.log 2>&1 & "
-            "echo $! >/tmp/openclaw_gateway.pid || true",
+            "rm -f /tmp/openclaw_gateway.pgid && "
+            f"nohup setsid sh -c 'exec openclaw gateway --port {self._gateway_port}' "
+            "</dev/null >/tmp/openclaw_gateway.log 2>&1 & "
+            "child=$!; echo $child >/tmp/openclaw_gateway.pgid; "
+            "echo GATEWAY_LAUNCHED",
             timeout=10,
         )
-        await self._wait_gateway_ready(environment)
+        if result.get("returncode", 1) != 0 or "GATEWAY_LAUNCHED" not in (
+            result.get("stdout") or ""
+        ):
+            raise RuntimeError(f"gateway launch failed: {result}")
+
+        if os.environ.get("PAWBENCH_PODMAN_NESTED") == "1":
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                self._gateway_pgid = self._gateway_group_for_port(self._gateway_port)
+                if self._gateway_pgid is not None:
+                    break
+                await asyncio.sleep(0.1)
+            if self._gateway_pgid is None:
+                raise RuntimeError(
+                    f"could not resolve gateway process group for port {self._gateway_port}"
+                )
+
+        await self._wait_gateway_ready(environment, port=self._gateway_port)
 
     async def _configure_openclaw_json(
         self,
@@ -562,7 +785,9 @@ class OpenClawAgent(ContainerAgent):
                 # openclaw gateway refuses to start if gateway.mode is absent.
                 # agents add may drop this field when rewriting openclaw.json;
                 # ensure it is always present after our patch.
-                + "d.setdefault('gateway', {}).setdefault('mode', 'local')\n"
+                + "gateway_cfg = d.setdefault('gateway', {})\n"
+                + "gateway_cfg.setdefault('mode', 'local')\n"
+                + f"gateway_cfg['port'] = {self._gateway_port}\n"
                 # ── agents.defaults ───────────────────────────────────────
                 + "agents_cfg = d.setdefault('agents', {}).setdefault('defaults', {})\n"
                 f"agents_cfg['model'] = {{'primary': {json.dumps(primary)}}}\n"
@@ -692,7 +917,7 @@ class OpenClawAgent(ContainerAgent):
         )
 
     async def _ensure_gateway(self, environment: BaseEnvironment, *, api_key: str = "", provider_str: str = "openai") -> None:
-        port = _GATEWAY_PORT
+        port = self._gateway_port
 
         # TCP-based liveness check: verify the gateway port is actually accepting
         # connections, not just that a process with the saved PID exists.
@@ -737,24 +962,15 @@ class OpenClawAgent(ContainerAgent):
           so it returns only when the browser plugin is actually serving
           requests (~15 s after the log line ``ready``).
         """
-        await environment.execute_command(
-            "pkill -9 -f 'openclaw gateway' 2>/dev/null; "
-            "pkill -9 -f 'openclaw-gateway' 2>/dev/null; "
-            "sleep 1; true",
-            timeout=10,
-        )
-
         provider_str_strict = (
-            (self.config.get("model", "dashscope/qwen3.6-plus") or "").split("/", 1)[0].lower()
+            (self.config.get("model", "dashscope/qwen3.6-plus") or "")
+            .split("/", 1)[0]
+            .lower()
             or "openai"
         )
-        await environment.execute_command(
-            self._make_key_env(provider_str_strict, api_key)
-            + "export OPENCLAW_DISABLE_BONJOUR=1 && "
-            "rm -f /tmp/openclaw_gateway.log && "
-            "nohup openclaw gateway >/tmp/openclaw_gateway.log 2>&1 & "
-            "echo $! >/tmp/openclaw_gateway.pid || true",
-            timeout=10,
+        await self._kill_gateway(environment)
+        await self._start_gateway(
+            environment, api_key=api_key, provider_str=provider_str_strict
         )
 
         wait_cmd = (
@@ -768,7 +984,11 @@ class OpenClawAgent(ContainerAgent):
             "echo GATEWAY_NOT_READY; "
             "tail -25 /tmp/openclaw_gateway.log 2>/dev/null || true"
         )
-        await environment.execute_command(wait_cmd, timeout=75)
+        result = await environment.execute_command(wait_cmd, timeout=75)
+        if result.get("returncode", 1) != 0 or "GATEWAY_READY" not in (
+            result.get("stdout") or ""
+        ):
+            raise RuntimeError(f"browser gateway did not become ready: {result}")
 
     async def _wait_for_session_flush(
         self,
@@ -818,10 +1038,17 @@ class OpenClawAgent(ContainerAgent):
             "print('SESSION_NOT_READY')\n"
         )
         await environment.write_file("/tmp/wait_openclaw_session.py", wait_script)
-        await environment.execute_command(
-            "python3 /tmp/wait_openclaw_session.py",
-            timeout=15,
-        )
+        try:
+            await environment.execute_command(
+                "python3 /tmp/wait_openclaw_session.py",
+                timeout=15,
+            )
+        except TimeoutError:
+            # This poll is explicitly best-effort.  A slow container exec must
+            # not erase an otherwise completed task; post_run_collect() still
+            # copies any session artifacts that are available, and the canary
+            # rejects an empty transcript before a full run can start.
+            return
 
     # ── run ───────────────────────────────────────────────────────────────────
 
@@ -856,8 +1083,9 @@ class OpenClawAgent(ContainerAgent):
         openclaw_model = self._openclaw_model_id(model_identifier)
         env_prefix = self._make_key_env(provider_str, api_key)
         check_result = await environment.execute_command(
-            f"{env_prefix}openclaw agents list 2>&1 || true",
-            timeout=30,
+            f"test -f /root/.openclaw/agents/{agent_id_lower}/agent/auth-profiles.json "
+            f"&& echo {shlex.quote(agent_id)} || true",
+            timeout=10,
         )
         check_output = (check_result.get("stdout") or "") + (check_result.get("stderr") or "")
         if agent_id.lower() not in check_output.lower():
@@ -896,6 +1124,7 @@ class OpenClawAgent(ContainerAgent):
                 "p = '/root/.openclaw/openclaw.json'\n"
                 "d = json.load(open(p)) if os.path.exists(p) else {}\n"
                 "d.setdefault('gateway', {})['mode'] = 'local'\n"
+            f"d['gateway']['port'] = {self._gateway_port}\n"
                 "json.dump(d, open(p, 'w'), indent=2)\n"
                 "print('gateway.mode ensured')\n",
             )
@@ -1146,10 +1375,10 @@ done
 
     async def teardown(self, environment: BaseEnvironment) -> None:
         agent_id = self._agent_id()
-        await environment.execute_command(
-            f"openclaw agents delete {shlex.quote(agent_id)} --force 2>/dev/null || true",
-            timeout=60,
-        )
+        # Each task owns an ephemeral container; deleting the agent through the
+        # CLI can block behind the live gateway.  Stop only this task's gateway
+        # and let container removal discard its private agent configuration.
+        await self._kill_gateway(environment)
         await environment.execute_command(
             "rm -f /tmp/openclaw_output.txt /tmp/patch_openclaw.py",
             timeout=10,
