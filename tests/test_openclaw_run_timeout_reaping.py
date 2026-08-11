@@ -165,7 +165,13 @@ def test_reap_is_a_no_op_outside_nested_podman(monkeypatch):
     assert called == []
 
 
-def test_reap_refuses_to_signal_an_unowned_group(monkeypatch):
+def test_reap_never_signals_a_foreign_member_of_a_recycled_group(monkeypatch):
+    """PIDs are recycled: the run pgid can already carry someone else's process.
+
+    Such a member must never be signalled, and must never hold the reaper open
+    either -- it will not exit, so treating it as ours turns every teardown of
+    a recycled group number into a hard failure.
+    """
     monkeypatch.setenv("PAWBENCH_PODMAN_NESTED", "1")
     foreign = (999, "0::/some-other-container.scope")
     mine = (12345, "0::/this-task.scope")
@@ -182,8 +188,36 @@ def test_reap_refuses_to_signal_an_unowned_group(monkeypatch):
     monkeypatch.setattr(
         OpenClawAgent, "_process_owner_token", staticmethod(lambda _pid: foreign)
     )
-    with pytest.raises(RuntimeError, match="unowned run group"):
-        asyncio.run(_agent()._reap_nested_agent_run("pawbench-unit-foreign"))
+    sent = []
+    monkeypatch.setattr(os, "pidfd_open", lambda pid: pid + 1000)
+    monkeypatch.setattr(os, "close", lambda fd: None)
+    monkeypatch.setattr(
+        signal, "pidfd_send_signal", lambda fd, sig: sent.append((fd - 1000, sig))
+    )
+
+    asyncio.run(_agent()._reap_nested_agent_run("pawbench-unit-foreign"))
+    assert sent == []
+
+
+def test_reap_refuses_to_signal_a_group_with_no_recorded_owner(monkeypatch):
+    monkeypatch.setenv("PAWBENCH_PODMAN_NESTED", "1")
+    monkeypatch.setattr(
+        OpenClawAgent,
+        "_run_group_for_session",
+        staticmethod(lambda _session: (4242, None)),
+    )
+    monkeypatch.setattr(
+        OpenClawAgent,
+        "_process_group_members",
+        staticmethod(lambda _pgid: [(4242, os.getuid(), "openclaw agent")]),
+    )
+    monkeypatch.setattr(
+        OpenClawAgent,
+        "_process_owner_token",
+        staticmethod(lambda _pid: (12345, "0::/task.scope")),
+    )
+    with pytest.raises(RuntimeError, match="without a recorded owner"):
+        asyncio.run(_agent()._reap_nested_agent_run("pawbench-unit-noowner"))
 
 
 def test_reap_escalates_to_children_without_the_session_marker(monkeypatch):
@@ -216,7 +250,7 @@ def test_reap_escalates_to_children_without_the_session_marker(monkeypatch):
     agent = _agent()
     waits = iter([False, True])
 
-    async def fake_wait(_pgid, _timeout):
+    async def fake_wait(_pgid, _timeout, _owner_token=None):
         return next(waits)
 
     monkeypatch.setattr(agent, "_wait_run_group_closed", fake_wait)
@@ -244,7 +278,7 @@ def test_reap_raises_when_a_survivor_remains(monkeypatch):
 
     agent = _agent()
 
-    async def never_closed(_pgid, _timeout):
+    async def never_closed(_pgid, _timeout, _owner_token=None):
         return False
 
     monkeypatch.setattr(agent, "_wait_run_group_closed", never_closed)
@@ -293,7 +327,9 @@ def test_signalling_tolerates_a_member_exiting_mid_reap(monkeypatch):
         owner_token=token,
     )
     assert sent == [(700, signal.SIGTERM)]
-    assert closed == [1701, 1700]
+    # 701 is already gone, so it is dropped before pidfd_open: no fd is opened
+    # for it and none has to be closed.
+    assert closed == [1700]
 
 
 def test_run_reports_an_unreapable_tree_without_destroying_evidence():

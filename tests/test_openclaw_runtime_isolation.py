@@ -274,7 +274,8 @@ def test_nested_gateway_group_cleanup_is_exact(monkeypatch):
             time.sleep(0.01)
         agent = OpenClawAgent(model="custom/Qwen3.5-4B")
         agent._gateway_pgid = process.pid
-        agent._gateway_owner_token = agent._process_owner_token(process.pid)
+        token = agent._process_owner_token(process.pid)
+        agent._gateway_owner_token = token
         monkeypatch.setenv("PAWBENCH_PODMAN_NESTED", "1")
         monkeypatch.setattr(agent, "_port_is_open", lambda _port: False)
 
@@ -285,8 +286,66 @@ def test_nested_gateway_group_cleanup_is_exact(monkeypatch):
         asyncio.run(agent._kill_gateway(Environment()))
         process.wait(timeout=5)
         assert agent._gateway_pgid is None
-        assert not agent._process_group_members(process.pid)
+        # Ownership-scoped: the node recycles PIDs, so an orphaned group may
+        # already carry a foreign process under this number. Only this task's
+        # own members have to be gone.
+        owned, _foreign = OpenClawAgent._partition_gateway_members(
+            process.pid, OpenClawAgent._process_group_members(process.pid), token
+        )
+        assert not owned
     finally:
         if process.poll() is None:
             os.killpg(process.pid, 9)
             process.wait(timeout=5)
+
+
+def test_gateway_cleanup_ignores_a_foreign_member_of_a_recycled_group(monkeypatch):
+    """Observed on the benchmark node: PID reuse puts a stranger in our group.
+
+    A brand-new ``setsid`` session was created with a number an orphaned group
+    still used, so the group contained a reparented ``sed`` owned by nobody we
+    track. Signalling it would be a cross-task kill; waiting for it to exit
+    would hang teardown forever and leak the container.
+    """
+    import os
+    import signal
+
+    pgid = 31337
+    uid = os.getuid()
+    mine = (12345, "0::/this-task.scope")
+    foreign_token = (999, "0::/")
+    tokens = {pgid: mine, pgid + 3: foreign_token}
+    members = [(pgid, uid, "openclaw gateway --port 28088"),
+               (pgid + 3, uid, "sed s/^$/unknown/ ")]
+    survivor = [(pgid + 3, uid, "sed s/^$/unknown/ ")]
+    snapshots = iter([members, survivor, survivor, survivor, survivor])
+
+    agent = OpenClawAgent(model="custom/Qwen3.5-4B")
+    agent._gateway_pgid = pgid
+    agent._gateway_owner_token = mine
+    monkeypatch.setenv("PAWBENCH_PODMAN_NESTED", "1")
+    monkeypatch.setattr(agent, "_port_is_open", lambda _port: False)
+    monkeypatch.setattr(agent, "_process_group_members", lambda _pgid: next(snapshots))
+    monkeypatch.setattr(
+        OpenClawAgent,
+        "_process_owner_token",
+        staticmethod(lambda pid: tokens[pid]),
+    )
+    monkeypatch.setattr(os, "getsid", lambda _pid: pgid)
+
+    sent = []
+    monkeypatch.setattr(os, "pidfd_open", lambda pid: pid + 1000)
+    monkeypatch.setattr(os, "close", lambda fd: None)
+    monkeypatch.setattr(
+        signal, "pidfd_send_signal", lambda fd, sig: sent.append((fd - 1000, sig))
+    )
+
+    class Environment:
+        async def execute_command(self, command, timeout=None):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    asyncio.run(agent._kill_gateway(Environment()))
+    # Only the gateway is signalled, and the surviving stranger does not turn a
+    # successful teardown into "gateway cleanup incomplete".
+    assert sent == [(pgid, signal.SIGTERM)]
+    assert agent._gateway_pgid is None

@@ -31,12 +31,24 @@ from pawbench.envs import docker as docker_env
 
 # ── gateway readiness ─────────────────────────────────────────────────────────
 
-def _probe(port: int, timeout: float) -> subprocess.CompletedProcess:
+def _probe(
+    port: int,
+    timeout: float,
+    log: str,
+    marker: str = openclaw_agent._GATEWAY_RUNTIME_READY_MARKER,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-c", openclaw_agent._GATEWAY_READY_PROBE,
-         str(port), str(timeout)],
+         str(port), str(timeout), log, marker],
         capture_output=True, text=True, timeout=timeout + 30,
     )
+
+
+def _ready_log(tmp_path, marker: str = openclaw_agent._GATEWAY_RUNTIME_READY_MARKER):
+    """A gateway log that already reports the runtime backend ready."""
+    path = tmp_path / "openclaw_gateway.log"
+    path.write_text(f"[plugins] {marker} (cwd: /app)\n")
+    return str(path)
 
 
 def _serve(handler, ready: threading.Event) -> tuple[int, threading.Thread]:
@@ -66,7 +78,7 @@ def _serve(handler, ready: threading.Event) -> tuple[int, threading.Thread]:
     return port, thread
 
 
-def test_probe_rejects_a_port_that_only_accepts_tcp():
+def test_probe_rejects_a_port_that_only_accepts_tcp(tmp_path):
     """The exact A12 failure: listener bound, handshake never answered."""
     stop = threading.Event()
 
@@ -76,7 +88,7 @@ def test_probe_rejects_a_port_that_only_accepts_tcp():
 
     port, thread = _serve(silent, stop)
     try:
-        result = _probe(port, 3)
+        result = _probe(port, 3, _ready_log(tmp_path))
         assert result.returncode == 1, result
         assert "GATEWAY_NOT_READY" in result.stdout
         assert "GATEWAY_READY\n" not in result.stdout
@@ -85,7 +97,7 @@ def test_probe_rejects_a_port_that_only_accepts_tcp():
         thread.join(timeout=10)
 
 
-def test_probe_accepts_a_completed_websocket_upgrade():
+def test_probe_accepts_a_completed_websocket_upgrade(tmp_path):
     stop = threading.Event()
 
     def upgrade(conn):
@@ -97,7 +109,7 @@ def test_probe_accepts_a_completed_websocket_upgrade():
 
     port, thread = _serve(upgrade, stop)
     try:
-        result = _probe(port, 10)
+        result = _probe(port, 10, _ready_log(tmp_path))
         assert result.returncode == 0, result
         assert "GATEWAY_READY" in result.stdout
     finally:
@@ -105,7 +117,7 @@ def test_probe_accepts_a_completed_websocket_upgrade():
         thread.join(timeout=10)
 
 
-def test_probe_rejects_a_plain_http_response():
+def test_probe_rejects_a_plain_http_response(tmp_path):
     """A 404/200 means the router is up but the agent channel is not."""
     stop = threading.Event()
 
@@ -115,7 +127,7 @@ def test_probe_rejects_a_plain_http_response():
 
     port, thread = _serve(not_found, stop)
     try:
-        result = _probe(port, 3)
+        result = _probe(port, 3, _ready_log(tmp_path))
         assert result.returncode == 1, result
         assert "404" in result.stdout
     finally:
@@ -123,7 +135,7 @@ def test_probe_rejects_a_plain_http_response():
         thread.join(timeout=10)
 
 
-def test_probe_becomes_ready_once_the_gateway_finishes_starting():
+def test_probe_becomes_ready_once_the_gateway_finishes_starting(tmp_path):
     """Readiness must be observed by polling, not by a single attempt."""
     stop = threading.Event()
     started = time.monotonic()
@@ -136,7 +148,7 @@ def test_probe_becomes_ready_once_the_gateway_finishes_starting():
 
     port, thread = _serve(late, stop)
     try:
-        result = _probe(port, 20)
+        result = _probe(port, 20, _ready_log(tmp_path))
         assert result.returncode == 0, result
         assert "GATEWAY_READY" in result.stdout
     finally:
@@ -156,10 +168,85 @@ def test_wait_gateway_ready_uses_the_websocket_probe():
     asyncio.run(agent._wait_gateway_ready(FakeEnv(), port=28088))
     command, timeout = calls[0]
     assert shlex.quote(openclaw_agent._GATEWAY_READY_PROBE) in command
-    assert command.endswith(f" 28088 {openclaw_agent._GATEWAY_READY_TIMEOUT_S}")
+    assert f" 28088 {openclaw_agent._GATEWAY_READY_TIMEOUT_S} " in command
+    # Both readiness signals have to reach the probe.
+    assert shlex.quote(openclaw_agent._GATEWAY_LOG) in command
+    assert shlex.quote(openclaw_agent._GATEWAY_RUNTIME_READY_MARKER) in command
     # The exec wall-clock must outlast the probe's own deadline, otherwise the
     # middle timeout kills the probe and the error blames the wrong layer.
     assert timeout > openclaw_agent._GATEWAY_READY_TIMEOUT_S
+
+
+def test_probe_rejects_a_101_before_the_runtime_backend_is_ready(tmp_path):
+    """The A/B failure: 101 answered while acpx was only *registered*.
+
+    A run submitted in that window is dropped with ``gateway closed (1000)``
+    and the client silently falls back to the embedded runtime.
+    """
+    stop = threading.Event()
+
+    def upgrade(conn):
+        conn.recv(1024)
+        conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+
+    log = tmp_path / "openclaw_gateway.log"
+    log.write_text("[plugins] embedded acpx runtime backend registered\n")
+    port, thread = _serve(upgrade, stop)
+    try:
+        result = _probe(port, 3, str(log))
+        assert result.returncode == 1, result
+        assert "runtime backend not ready" in result.stdout
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+
+
+def test_probe_accepts_once_the_runtime_backend_reports_ready(tmp_path):
+    stop = threading.Event()
+
+    def upgrade(conn):
+        conn.recv(1024)
+        conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+
+    log = tmp_path / "openclaw_gateway.log"
+    log.write_text("[plugins] embedded acpx runtime backend registered\n")
+
+    def finish_starting():
+        time.sleep(2)
+        with log.open("a") as handle:
+            handle.write(
+                f"[plugins] {openclaw_agent._GATEWAY_RUNTIME_READY_MARKER}\n"
+            )
+
+    writer = threading.Thread(target=finish_starting, daemon=True)
+    writer.start()
+    port, thread = _serve(upgrade, stop)
+    try:
+        result = _probe(port, 20, str(log))
+        assert result.returncode == 0, result
+        assert "GATEWAY_READY" in result.stdout
+    finally:
+        stop.set()
+        writer.join(timeout=10)
+        thread.join(timeout=10)
+
+
+def test_probe_tolerates_a_gateway_log_that_does_not_exist_yet(tmp_path):
+    """The gateway is launched with nohup; its log can lag the first poll."""
+    stop = threading.Event()
+
+    def upgrade(conn):
+        conn.recv(1024)
+        conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+
+    port, thread = _serve(upgrade, stop)
+    try:
+        result = _probe(port, 3, str(tmp_path / "absent.log"))
+        assert result.returncode == 1, result
+        assert "runtime backend not ready" in result.stdout
+    finally:
+        stop.set()
+        thread.join(timeout=10)
 
 
 def test_wait_gateway_ready_raises_when_the_handshake_never_lands():

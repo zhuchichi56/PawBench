@@ -39,11 +39,23 @@ _RUN_STATUS_FILE = "/tmp/openclaw_run_status.txt"
 # internet egress). A TCP-only probe therefore hands the agent a gateway that
 # rejects it, and the lost time is charged to the task's own budget.
 _GATEWAY_READY_TIMEOUT_S = 240
+_GATEWAY_LOG = "/tmp/openclaw_gateway.log"
+# A completed WebSocket upgrade is necessary but not sufficient. The gateway
+# answers 101 once the acpx runtime backend is *registered*; it cannot serve an
+# agent run until that backend is *ready*. Measured on this image: 6s apart in
+# the default configuration, but 141s apart when channel startup is reordered,
+# and a client that connects inside that window is dropped with
+# "gateway closed (1000)" and silently falls back to the embedded runtime --
+# a different execution path than the one under evaluation. ``_start_gateway``
+# truncates this log, so the marker can only come from the current gateway.
+_GATEWAY_RUNTIME_READY_MARKER = "embedded acpx runtime backend ready"
 _GATEWAY_READY_PROBE = r'''
 import socket, sys, time
 
 port = int(sys.argv[1])
 deadline = time.time() + float(sys.argv[2])
+log_path = sys.argv[3]
+marker = sys.argv[4]
 request = (
     "GET / HTTP/1.1\r\n"
     "Host: 127.0.0.1:%d\r\n"
@@ -54,8 +66,21 @@ request = (
     "\r\n"
 ) % port
 
+
+def runtime_ready():
+    try:
+        with open(log_path, "rb") as handle:
+            return marker.encode() in handle.read()
+    except OSError:
+        return False
+
+
 last = "no attempt"
 while time.time() < deadline:
+    if not runtime_ready():
+        last = "runtime backend not ready"
+        time.sleep(0.5)
+        continue
     sock = socket.socket()
     sock.settimeout(2.0)
     try:
@@ -496,36 +521,45 @@ class OpenClawAgent(ContainerAgent):
             )
         return next(iter(groups)) if groups else None
 
+    def _owned_group_members(self, pgid: int) -> list[tuple[int, int, str]]:
+        owned, _foreign = self._partition_gateway_members(
+            pgid, self._process_group_members(pgid), self._gateway_owner_token
+        )
+        return owned
+
     async def _wait_nested_gateway_closed(self, pgid: int, timeout: float) -> bool:
+        # Only this task's own members may gate the wait: a foreign process that
+        # shares the recycled group number never exits, and waiting for it would
+        # turn every teardown into a timeout.
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if not self._process_group_members(pgid) and not self._port_is_open(
+            if not self._owned_group_members(pgid) and not self._port_is_open(
                 self._gateway_port
             ):
                 return True
             await asyncio.sleep(0.1)
-        return not self._process_group_members(pgid) and not self._port_is_open(
+        return not self._owned_group_members(pgid) and not self._port_is_open(
             self._gateway_port
         )
 
     @staticmethod
-    def _validate_owned_gateway_group(
+    def _partition_gateway_members(
         pgid: int,
         members: list[tuple[int, int, str]],
-        *,
-        require_openclaw: bool,
         owner_token: tuple[int, str] | None,
-    ) -> None:
-        """Prove that every process still belongs to this task's gateway session.
+    ) -> tuple[list[tuple[int, int, str]], list[tuple[int, int, str]]]:
+        """Split one process group into this task's members and foreign ones.
 
-        OpenClaw may spawn helper commands such as ``npm install`` inside the
-        gateway process group. Requiring every command line to contain
-        ``openclaw`` therefore rejects legitimate children and leaves the
-        listener alive. The gateway is launched with ``setsid``, so its session
-        ID equals the recorded process-group ID; same-user membership in that
-        session is the stable ownership boundary even when child argv changes.
+        PIDs are recycled. An orphaned process group outlives its leader, so the
+        number the kernel later hands to this task's gateway session can already
+        carry someone else's process -- observed on the benchmark node as a
+        reparented ``sed`` sharing both pgid and sid with a session created
+        seconds earlier. Ownership is therefore decided per process rather than
+        per group: same user, same session, and the same pid namespace and
+        cgroup as the gateway recorded at start.
         """
-        bad: list[tuple[int, int, str]] = []
+        owned: list[tuple[int, int, str]] = []
+        foreign: list[tuple[int, int, str]] = []
         for item in members:
             pid, uid, _cmd = item
             try:
@@ -534,21 +568,55 @@ class OpenClawAgent(ContainerAgent):
                 continue
             token = OpenClawAgent._process_owner_token(pid)
             if (
-                uid != os.getuid()
-                or sid != pgid
-                or owner_token is None
-                or token != owner_token
+                uid == os.getuid()
+                and sid == pgid
+                and owner_token is not None
+                and token == owner_token
             ):
-                bad.append(item)
-        if bad:
-            raise RuntimeError(f"refusing to signal unowned gateway group {pgid}: {bad}")
-        if require_openclaw and members and not any(
-            "openclaw" in item[2].lower() for item in members
+                owned.append(item)
+            else:
+                foreign.append(item)
+        return owned, foreign
+
+    @staticmethod
+    def _validate_owned_gateway_group(
+        pgid: int,
+        members: list[tuple[int, int, str]],
+        *,
+        require_openclaw: bool,
+        owner_token: tuple[int, str] | None,
+    ) -> list[tuple[int, int, str]]:
+        """Return the members this task may signal, or refuse to signal at all.
+
+        OpenClaw may spawn helper commands such as ``npm install`` inside the
+        gateway process group. Requiring every command line to contain
+        ``openclaw`` therefore rejects legitimate children and leaves the
+        listener alive. The gateway is launched with ``setsid``, so its session
+        ID equals the recorded process-group ID; same-user membership in that
+        session, pinned to the recorded namespace and cgroup, is the stable
+        ownership boundary even when child argv changes.
+
+        Foreign members are excluded instead of aborting the teardown: they
+        cannot be signalled, but a recycled group number must not strand this
+        task's own gateway. Cleanup is still proven end to end by
+        ``_wait_nested_gateway_closed``, which requires the listener closed.
+        """
+        if members and owner_token is None:
+            raise RuntimeError(
+                f"refusing to signal gateway group {pgid} without a recorded owner: "
+                f"{members}"
+            )
+        owned, _foreign = OpenClawAgent._partition_gateway_members(
+            pgid, members, owner_token
+        )
+        if require_openclaw and owned and not any(
+            "openclaw" in item[2].lower() for item in owned
         ):
             raise RuntimeError(
                 f"refusing to signal gateway group {pgid} without an OpenClaw member: "
-                f"{members}"
+                f"{owned}"
             )
+        return owned
 
     @classmethod
     def _signal_owned_gateway_members(
@@ -561,7 +629,7 @@ class OpenClawAgent(ContainerAgent):
         owner_token: tuple[int, str] | None,
     ) -> None:
         """Signal exact process identities without a killpg PID-reuse race."""
-        cls._validate_owned_gateway_group(
+        owned = cls._validate_owned_gateway_group(
             pgid,
             members,
             require_openclaw=require_openclaw,
@@ -569,7 +637,7 @@ class OpenClawAgent(ContainerAgent):
         )
         pidfds: list[int] = []
         try:
-            for pid, _uid, _cmd in members:
+            for pid, _uid, _cmd in owned:
                 try:
                     pidfd = os.pidfd_open(pid)
                 except ProcessLookupError:
@@ -581,10 +649,11 @@ class OpenClawAgent(ContainerAgent):
                     os.close(pidfd)
                     continue
                 if sid != pgid or token != owner_token:
+                    # The pid was recycled between the scan and the pin. The
+                    # process now holding it is not ours, so drop it rather
+                    # than signal it or abandon the rest of the teardown.
                     os.close(pidfd)
-                    raise RuntimeError(
-                        f"gateway member changed before signal: pgid={pgid} pid={pid}"
-                    )
+                    continue
                 pidfds.append(pidfd)
             for pidfd in pidfds:
                 try:
@@ -612,7 +681,9 @@ class OpenClawAgent(ContainerAgent):
                 # that retain the recorded task namespace and cgroup identity.
                 for _ in range(3):
                     members = self._process_group_members(pgid)
-                    if not members:
+                    if not self._partition_gateway_members(
+                        pgid, members, owner_token
+                    )[0]:
                         break
                     self._signal_owned_gateway_members(
                         pgid,
@@ -625,7 +696,7 @@ class OpenClawAgent(ContainerAgent):
         if not await self._wait_nested_gateway_closed(pgid, 5):
             raise RuntimeError(
                 f"gateway cleanup incomplete: pgid={pgid} port={self._gateway_port} "
-                f"members={self._process_group_members(pgid)}"
+                f"members={self._owned_group_members(pgid)}"
             )
 
     def _agent_run_command(
@@ -732,6 +803,31 @@ class OpenClawAgent(ContainerAgent):
         return next(iter(candidates)), owner_token
 
     @staticmethod
+    def _partition_run_members(
+        members: list[tuple[int, int, str]],
+        owner_token: tuple[int, str] | None,
+    ) -> tuple[list[tuple[int, int, str]], list[tuple[int, int, str]]]:
+        """Split one run group into this attempt's members and foreign ones.
+
+        Same recycled-group-number exposure as the gateway path: the run tree's
+        pgid can already be carried by an orphaned group whose surviving member
+        belongs to someone else. Such a process is never signalled and never
+        allowed to hold the reaper open.
+        """
+        owned: list[tuple[int, int, str]] = []
+        foreign: list[tuple[int, int, str]] = []
+        for item in members:
+            pid, uid, _cmd = item
+            token = OpenClawAgent._process_owner_token(pid)
+            if token is None:
+                continue  # exited between the scan and the check
+            if uid == os.getuid() and owner_token is not None and token == owner_token:
+                owned.append(item)
+            else:
+                foreign.append(item)
+        return owned, foreign
+
+    @staticmethod
     def _validate_owned_run_group(
         pgid: int,
         members: list[tuple[int, int, str]],
@@ -739,8 +835,8 @@ class OpenClawAgent(ContainerAgent):
         session_id: str,
         require_session_marker: bool,
         owner_token: tuple[int, str] | None,
-    ) -> None:
-        """Prove every member still belongs to this attempt's agent run.
+    ) -> list[tuple[int, int, str]]:
+        """Return the members this attempt may signal, or refuse to signal.
 
         The run tree is not a session leader (``timeout`` creates a process
         group, not a session), so gateway-style ``sid == pgid`` validation does
@@ -750,23 +846,20 @@ class OpenClawAgent(ContainerAgent):
         ``openclaw`` launcher may exit while ``openclaw-agent`` children, whose
         argv omits the marker, remain.
         """
-        bad: list[tuple[int, int, str]] = []
-        for item in members:
-            pid, uid, _cmd = item
-            token = OpenClawAgent._process_owner_token(pid)
-            if token is None:
-                continue
-            if uid != os.getuid() or owner_token is None or token != owner_token:
-                bad.append(item)
-        if bad:
-            raise RuntimeError(f"refusing to signal unowned run group {pgid}: {bad}")
-        if require_session_marker and members and not any(
-            f"--session-id {session_id} " in item[2] for item in members
+        if members and owner_token is None:
+            raise RuntimeError(
+                f"refusing to signal run group {pgid} without a recorded owner: "
+                f"{members}"
+            )
+        owned, _foreign = OpenClawAgent._partition_run_members(members, owner_token)
+        if require_session_marker and owned and not any(
+            f"--session-id {session_id} " in item[2] for item in owned
         ):
             raise RuntimeError(
                 f"refusing to signal run group {pgid} without session {session_id}: "
-                f"{members}"
+                f"{owned}"
             )
+        return owned
 
     @classmethod
     def _signal_owned_run_members(
@@ -780,7 +873,7 @@ class OpenClawAgent(ContainerAgent):
         owner_token: tuple[int, str] | None,
     ) -> None:
         """Signal exact run-tree identities without a killpg PID-reuse race."""
-        cls._validate_owned_run_group(
+        owned = cls._validate_owned_run_group(
             pgid,
             members,
             session_id=session_id,
@@ -789,7 +882,7 @@ class OpenClawAgent(ContainerAgent):
         )
         pidfds: list[int] = []
         try:
-            for pid, _uid, _cmd in members:
+            for pid, _uid, _cmd in owned:
                 try:
                     pidfd = os.pidfd_open(pid)
                 except ProcessLookupError:
@@ -800,10 +893,10 @@ class OpenClawAgent(ContainerAgent):
                     os.close(pidfd)
                     continue
                 if token != owner_token:
+                    # Recycled pid: the pin caught a different process. Drop it
+                    # instead of signalling it or abandoning the reap.
                     os.close(pidfd)
-                    raise RuntimeError(
-                        f"run member changed before signal: pgid={pgid} pid={pid}"
-                    )
+                    continue
                 pidfds.append(pidfd)
             for pidfd in pidfds:
                 try:
@@ -814,13 +907,23 @@ class OpenClawAgent(ContainerAgent):
             for pidfd in pidfds:
                 os.close(pidfd)
 
-    async def _wait_run_group_closed(self, pgid: int, timeout: float) -> bool:
+    def _owned_run_members(
+        self, pgid: int, owner_token: tuple[int, str] | None
+    ) -> list[tuple[int, int, str]]:
+        owned, _foreign = self._partition_run_members(
+            self._process_group_members(pgid), owner_token
+        )
+        return owned
+
+    async def _wait_run_group_closed(
+        self, pgid: int, timeout: float, owner_token: tuple[int, str] | None = None
+    ) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if not self._process_group_members(pgid):
+            if not self._owned_run_members(pgid, owner_token):
                 return True
             await asyncio.sleep(0.1)
-        return not self._process_group_members(pgid)
+        return not self._owned_run_members(pgid, owner_token)
 
     async def _reap_nested_agent_run(self, session_id: str) -> None:
         """Guarantee this attempt's agent tree is dead before the task ends.
@@ -846,10 +949,12 @@ class OpenClawAgent(ContainerAgent):
                 require_session_marker=True,
                 owner_token=owner_token,
             )
-            if not await self._wait_run_group_closed(pgid, _RUN_REAP_GRACE_S):
+            if not await self._wait_run_group_closed(
+                pgid, _RUN_REAP_GRACE_S, owner_token
+            ):
                 for _ in range(3):
                     members = self._process_group_members(pgid)
-                    if not members:
+                    if not self._partition_run_members(members, owner_token)[0]:
                         break
                     self._signal_owned_run_members(
                         pgid,
@@ -860,10 +965,12 @@ class OpenClawAgent(ContainerAgent):
                         owner_token=owner_token,
                     )
                     await asyncio.sleep(0.1)
-        if not await self._wait_run_group_closed(pgid, _RUN_REAP_GRACE_S):
+        if not await self._wait_run_group_closed(
+            pgid, _RUN_REAP_GRACE_S, owner_token
+        ):
             raise RuntimeError(
                 f"agent run cleanup incomplete: pgid={pgid} session={session_id} "
-                f"members={self._process_group_members(pgid)}"
+                f"members={self._owned_run_members(pgid, owner_token)}"
             )
 
     async def _kill_gateway(self, environment: BaseEnvironment) -> None:
@@ -901,18 +1008,25 @@ class OpenClawAgent(ContainerAgent):
     async def _wait_gateway_ready(
         self, environment: BaseEnvironment, *, port: int | None = None
     ) -> None:
-        """Block until the gateway can actually complete a WebSocket connect.
+        """Block until the gateway can actually serve an agent run.
 
         An open TCP port is not readiness: the listener is bound long before the
         channel/sidecar phase finishes, and an agent that connects during that
         window gets ``[ws] handshake timeout`` followed by ``code=1008 reason=
-        connect failed``. Requiring an HTTP ``101`` keeps that startup cost in
-        setup, where it belongs, instead of silently eating the task's budget.
+        connect failed``. A completed WebSocket upgrade is still not enough --
+        the gateway answers 101 while the acpx runtime backend is only
+        registered, and a run submitted before that backend reports ready is
+        dropped with ``gateway closed (1000)`` and falls back to the embedded
+        runtime. Requiring both keeps the startup cost in setup, where it
+        belongs, instead of silently eating the task's budget or swapping the
+        execution path underneath the benchmark.
         """
         port = self._gateway_port if port is None else port
         probe = shlex.quote(_GATEWAY_READY_PROBE)
         result = await environment.execute_command(
-            f"python3 -c {probe} {port} {_GATEWAY_READY_TIMEOUT_S}",
+            f"python3 -c {probe} {port} {_GATEWAY_READY_TIMEOUT_S} "
+            f"{shlex.quote(_GATEWAY_LOG)} "
+            f"{shlex.quote(_GATEWAY_RUNTIME_READY_MARKER)}",
             timeout=_GATEWAY_READY_TIMEOUT_S + _OPENCLAW_CONTROL_TIMEOUT,
         )
         if result.get("returncode", 1) != 0 or "GATEWAY_READY" not in (
@@ -936,7 +1050,7 @@ class OpenClawAgent(ContainerAgent):
             + "export OPENCLAW_DISABLE_BONJOUR=1 && "
             "rm -f /tmp/openclaw_gateway.pgid && "
             f"nohup setsid sh -c 'exec openclaw gateway --port {self._gateway_port}' "
-            "</dev/null >/tmp/openclaw_gateway.log 2>&1 & "
+            f"</dev/null >{_GATEWAY_LOG} 2>&1 & "
             "child=$!; echo $child >/tmp/openclaw_gateway.pgid; "
             "echo GATEWAY_LAUNCHED",
             timeout=_OPENCLAW_CONTROL_TIMEOUT,
