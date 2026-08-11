@@ -238,7 +238,10 @@ class DockerEnvironment(BaseEnvironment):
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
-                raise TimeoutError(f"Command timed out after {wait_timeout} seconds")
+                snippet = command if len(command) <= 500 else command[:500] + "..."
+                raise TimeoutError(
+                    f"Command timed out after {wait_timeout} seconds: {snippet}"
+                )
 
             return {
                 "stdout": stdout.decode(errors="replace") if stdout else "",
