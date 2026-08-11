@@ -280,6 +280,8 @@ class PawBenchBackend(BenchmarkBackend):
         local_workspace: Path | None = None
         stdout_output = ""
         exit_ok = False
+        run_timed_out = False
+        run_error = ""
 
         try:
             await env.start()
@@ -306,6 +308,16 @@ class PawBenchBackend(BenchmarkBackend):
             run_result = await agent.run(task.prompt, env)
             stdout_output = run_result.get("output", "")
             exit_ok = run_result.get("success", False)
+            # An agent that exhausted its own task budget must be reported as a
+            # timeout: the runner retries on it and anomaly detection can no
+            # longer mistake a truncated run for a clean success. Carry the
+            # agent's own diagnosis for every failure so the cause is visible
+            # instead of an empty error string.
+            run_timed_out = bool(run_result.get("timed_out", False))
+            if not exit_ok:
+                run_error = str(run_result.get("error", "")) or (
+                    "agent run timed out" if run_timed_out else "agent run failed"
+                )
 
             # Let the agent sync any agent-internal dirs into the standard workspace.
             await agent.post_run_collect(env)
@@ -388,7 +400,7 @@ class PawBenchBackend(BenchmarkBackend):
             "usage": {},
             "workspace": str(local_workspace) if local_workspace else "",
             "exit_code": 0 if exit_ok else 1,
-            "timed_out": False,
+            "timed_out": run_timed_out,
             "execution_time": time.time() - t0,
             "stdout": stdout_output,
             "stderr": "",
@@ -478,7 +490,8 @@ class PawBenchBackend(BenchmarkBackend):
             status=execution_result["status"],
             usage=_extract_usage_from_transcript(transcript, model=agent_config.get("model")),
             transcript_length=len(transcript),
-            timed_out=False,
+            timed_out=run_timed_out,
+            error=run_error,
             transcript=transcript,
             anomaly=anomaly,
             labels=task_labels,

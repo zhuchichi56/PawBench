@@ -11,8 +11,9 @@ def test_nested_container_cleanup_is_bounded(monkeypatch):
         calls.append((command, kwargs))
         if command[1] == "stop":
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
-        if command[1:3] == ["container", "exists"]:
-            return subprocess.CompletedProcess(command, 1)
+        if command[1:3] == ["ps", "-aq"]:
+            # Authoritative postcondition: no container record remains.
+            return subprocess.CompletedProcess(command, 0, stdout="")
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -26,8 +27,8 @@ def test_nested_container_cleanup_is_bounded(monkeypatch):
         ["stop", "-t", "5", "task-container"],
         ["rm", "-f", "task-container"],
         ["container", "cleanup", "--rm", "task-container"],
-        ["container", "exists", "task-container"],
+        ["ps", "-aq", "--filter", "name=^task-container$"],
     ]
-    assert [call[1]["timeout"] for call in calls] == [15, 15, 15, 10]
+    assert [call[1]["timeout"] for call in calls] == [15, 15, 15, 15]
     assert environment.container_id is None
     assert environment.is_running is False

@@ -10,6 +10,7 @@ import signal
 import socket
 import threading
 import time
+import uuid
 from typing import Any, Dict, List
 
 from pawbench.agents.base import ContainerAgent
@@ -25,6 +26,11 @@ _OPENCLAW_PORTS = itertools.count(28088, 20)
 _OPENCLAW_SETUP_LIMIT_ENV = "PAWBENCH_OPENCLAW_SETUP_CONCURRENCY"
 _OPENCLAW_SETUP_LIMIT_DEFAULT = 8
 _OPENCLAW_CONTROL_TIMEOUT = 60
+# `openclaw agent` ignores SIGTERM while it is waiting on the model server, so
+# the in-container timeout must escalate to SIGKILL instead of waiting forever.
+_INNER_RUN_KILL_GRACE_S = 10
+_RUN_REAP_GRACE_S = 5
+_RUN_STATUS_FILE = "/tmp/openclaw_run_status.txt"
 _OPENCLAW_SETUP_SEMAPHORE: threading.BoundedSemaphore | None = None
 _OPENCLAW_SETUP_LOCK = threading.Lock()
 _OPENCLAW_SETUP_LIMIT: int | None = None
@@ -71,6 +77,7 @@ class OpenClawAgent(ContainerAgent):
         self._gateway_port = next(_OPENCLAW_PORTS)
         self._gateway_pgid: int | None = None
         self._gateway_owner_token: tuple[int, str] | None = None
+        self._run_session_id: str | None = None
 
     def _agent_id(self) -> str:
         """Return a task-unique, filesystem-safe OpenClaw agent ID."""
@@ -575,6 +582,244 @@ class OpenClawAgent(ContainerAgent):
         if not await self._wait_nested_gateway_closed(pgid, 5):
             raise RuntimeError(
                 f"gateway cleanup incomplete: pgid={pgid} port={self._gateway_port} "
+                f"members={self._process_group_members(pgid)}"
+            )
+
+    def _agent_run_command(
+        self,
+        *,
+        provider_str: str,
+        api_key: str,
+        agent_id: str,
+        session_id: str,
+        inner_timeout: int,
+        thinking_args: str,
+        escaped_message: str,
+    ) -> str:
+        """Build the in-container agent command with an enforced kill escalation.
+
+        Plain ``timeout Ns`` only sends SIGTERM. ``openclaw agent`` does not
+        exit on SIGTERM once it is waiting on the model server, so the task
+        budget elapsed while the agent kept running and kept issuing requests.
+        ``--kill-after`` bounds that tail without changing the task budget
+        itself, which is benchmark semantics.
+
+        The trailing ``|| true`` keeps a non-zero agent exit from being read as
+        an infrastructure failure, but it also hid the timeout exit status, so a
+        task killed at its budget was recorded as a clean success with an empty
+        transcript. Record the real status of the first pipeline element instead
+        of inferring it from the masked exit code.
+        """
+        return (
+            self._make_key_env(provider_str, api_key)
+            + f"cd {shlex.quote(AGENT_WORKSPACE)} && "
+            f"timeout --kill-after={_INNER_RUN_KILL_GRACE_S}s {inner_timeout}s "
+            "openclaw agent "
+            f"--agent {shlex.quote(agent_id)} --session-id {session_id} "
+            f"{thinking_args}--message {escaped_message} "
+            f"2>&1 | tee /tmp/openclaw_output.txt; "
+            f'echo "${{PIPESTATUS[0]}}" > {_RUN_STATUS_FILE}; true'
+        )
+
+    @staticmethod
+    def _inner_run_timed_out(status_text: str | None) -> bool:
+        """Report whether the in-container agent was killed at its budget."""
+        if not status_text:
+            return False
+        try:
+            return int(status_text.strip()) in (124, 137)
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _run_group_for_session(session_id: str) -> tuple[int, tuple[int, str] | None] | None:
+        """Resolve the host process group running one agent session.
+
+        Coreutils ``timeout`` makes itself a process-group leader before
+        exec'ing ``openclaw agent``, so the agent tree lives in its own group,
+        which is exactly why the outer exec timeout cannot reach it. The session
+        ID is unique per attempt, which makes the match exact even with many
+        concurrent tasks.
+
+        The session ID also appears in the argv of the wrappers that carry the
+        command as a single shell string: the host ``podman exec`` client, the
+        outer exec ``timeout`` and its ``bash``. Those live in the runner's own
+        process group and must never be signalled, so shell invocations (an
+        argv element of ``-c``) are excluded and only the directly exec'd agent
+        processes are considered.
+        """
+        marker = f"--session-id {session_id} "
+        candidates: set[int] = set()
+        owner_token: tuple[int, str] | None = None
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                raw = open(f"/proc/{pid}/stat", encoding="utf-8").read()
+                fields = raw[raw.rfind(")") + 2 :].split()
+                if fields[0] == "Z":
+                    continue
+                pgid = int(fields[2])
+                if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                    continue
+                argv = (
+                    open(f"/proc/{pid}/cmdline", "rb")
+                    .read()
+                    .decode(errors="replace")
+                    .split("\0")
+                )
+            except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+                continue
+            cmd = " ".join(argv)
+            if marker not in cmd or "-c" in argv:
+                continue
+            candidates.add(pgid)
+            if owner_token is None or pid == pgid:
+                token = OpenClawAgent._process_owner_token(pid)
+                if token is not None:
+                    owner_token = token
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"multiple process groups own agent session {session_id}: "
+                f"{sorted(candidates)}"
+            )
+        return next(iter(candidates)), owner_token
+
+    @staticmethod
+    def _validate_owned_run_group(
+        pgid: int,
+        members: list[tuple[int, int, str]],
+        *,
+        session_id: str,
+        require_session_marker: bool,
+        owner_token: tuple[int, str] | None,
+    ) -> None:
+        """Prove every member still belongs to this attempt's agent run.
+
+        The run tree is not a session leader (``timeout`` creates a process
+        group, not a session), so gateway-style ``sid == pgid`` validation does
+        not apply. Same-user membership of the recorded group plus an identical
+        namespace/cgroup token is the ownership boundary here. The unique
+        session marker is only required on the first pass: ``timeout`` and the
+        ``openclaw`` launcher may exit while ``openclaw-agent`` children, whose
+        argv omits the marker, remain.
+        """
+        bad: list[tuple[int, int, str]] = []
+        for item in members:
+            pid, uid, _cmd = item
+            token = OpenClawAgent._process_owner_token(pid)
+            if token is None:
+                continue
+            if uid != os.getuid() or owner_token is None or token != owner_token:
+                bad.append(item)
+        if bad:
+            raise RuntimeError(f"refusing to signal unowned run group {pgid}: {bad}")
+        if require_session_marker and members and not any(
+            f"--session-id {session_id} " in item[2] for item in members
+        ):
+            raise RuntimeError(
+                f"refusing to signal run group {pgid} without session {session_id}: "
+                f"{members}"
+            )
+
+    @classmethod
+    def _signal_owned_run_members(
+        cls,
+        pgid: int,
+        members: list[tuple[int, int, str]],
+        sig: signal.Signals,
+        *,
+        session_id: str,
+        require_session_marker: bool,
+        owner_token: tuple[int, str] | None,
+    ) -> None:
+        """Signal exact run-tree identities without a killpg PID-reuse race."""
+        cls._validate_owned_run_group(
+            pgid,
+            members,
+            session_id=session_id,
+            require_session_marker=require_session_marker,
+            owner_token=owner_token,
+        )
+        pidfds: list[int] = []
+        try:
+            for pid, _uid, _cmd in members:
+                try:
+                    pidfd = os.pidfd_open(pid)
+                except ProcessLookupError:
+                    continue
+                token = cls._process_owner_token(pid)
+                if token is None:
+                    # The member exited between the snapshot and pidfd_open.
+                    os.close(pidfd)
+                    continue
+                if token != owner_token:
+                    os.close(pidfd)
+                    raise RuntimeError(
+                        f"run member changed before signal: pgid={pgid} pid={pid}"
+                    )
+                pidfds.append(pidfd)
+            for pidfd in pidfds:
+                try:
+                    signal.pidfd_send_signal(pidfd, sig)
+                except ProcessLookupError:
+                    pass
+        finally:
+            for pidfd in pidfds:
+                os.close(pidfd)
+
+    async def _wait_run_group_closed(self, pgid: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._process_group_members(pgid):
+                return True
+            await asyncio.sleep(0.1)
+        return not self._process_group_members(pgid)
+
+    async def _reap_nested_agent_run(self, session_id: str) -> None:
+        """Guarantee this attempt's agent tree is dead before the task ends.
+
+        Only meaningful under nested Podman, where ``--pid host`` makes the
+        container's descendants host-visible and lets them survive ``podman
+        rm``. A survivor keeps consuming model-server capacity and starves every
+        later task, so an unreapable tree is raised rather than ignored.
+        """
+        if os.environ.get("PAWBENCH_PODMAN_NESTED") != "1":
+            return
+        resolved = self._run_group_for_session(session_id)
+        if resolved is None:
+            return
+        pgid, owner_token = resolved
+        members = self._process_group_members(pgid)
+        if members:
+            self._signal_owned_run_members(
+                pgid,
+                members,
+                signal.SIGTERM,
+                session_id=session_id,
+                require_session_marker=True,
+                owner_token=owner_token,
+            )
+            if not await self._wait_run_group_closed(pgid, _RUN_REAP_GRACE_S):
+                for _ in range(3):
+                    members = self._process_group_members(pgid)
+                    if not members:
+                        break
+                    self._signal_owned_run_members(
+                        pgid,
+                        members,
+                        signal.SIGKILL,
+                        session_id=session_id,
+                        require_session_marker=False,
+                        owner_token=owner_token,
+                    )
+                    await asyncio.sleep(0.1)
+        if not await self._wait_run_group_closed(pgid, _RUN_REAP_GRACE_S):
+            raise RuntimeError(
+                f"agent run cleanup incomplete: pgid={pgid} session={session_id} "
                 f"members={self._process_group_members(pgid)}"
             )
 
@@ -1257,7 +1502,11 @@ class OpenClawAgent(ContainerAgent):
             )
 
         escaped = shlex.quote(instruction)
-        session_id = f"pawbench-{int(time.time() * 1000)}"
+        # Millisecond timestamps collide across concurrent tasks, and the
+        # session ID is the ownership key used to reap this attempt's process
+        # tree. Make it unique per attempt.
+        session_id = f"pawbench-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        self._run_session_id = session_id
 
         inner_timeout = int(self.config.get("task_timeout_s") or 1800)
 
@@ -1268,13 +1517,14 @@ class OpenClawAgent(ContainerAgent):
             f"--thinking {shlex.quote(thinking_level)} " if thinking_level else ""
         )
 
-        run_cmd = (
-            self._make_key_env(provider_str, api_key)
-            + f"cd {shlex.quote(AGENT_WORKSPACE)} && "
-            f"timeout {inner_timeout}s openclaw agent "
-            f"--agent {shlex.quote(agent_id)} --session-id {session_id} "
-            f"{thinking_args}--message {escaped} "
-            f"2>&1 | tee /tmp/openclaw_output.txt || true"
+        run_cmd = self._agent_run_command(
+            provider_str=provider_str,
+            api_key=api_key,
+            agent_id=agent_id,
+            session_id=session_id,
+            inner_timeout=inner_timeout,
+            thinking_args=thinking_args,
+            escaped_message=escaped,
         )
         # Snapshot existing text files before the run starts so that
         # extract_transcript() can exclude pre-staged fixture files.
@@ -1293,7 +1543,50 @@ class OpenClawAgent(ContainerAgent):
         # Record run start time so extract_transcript() can identify
         # files created during this task (vs pre-mounted fixture files).
         self._run_start_time: float = time.time()
-        result = await environment.execute_command(run_cmd, timeout=inner_timeout + 60)
+        run_timed_out = False
+        run_error = ""
+        try:
+            result = await environment.execute_command(
+                run_cmd, timeout=inner_timeout + 60
+            )
+        except TimeoutError as exc:
+            # Exhausting the per-task budget is a task outcome, not an
+            # infrastructure fault. Letting it propagate aborted
+            # post_run_collect() and workspace collection in the backend, so a
+            # slow task was reported with an empty transcript and no workspace
+            # at all. Record the timeout and keep collecting the partial run.
+            run_timed_out = True
+            run_error = str(exc)
+            result = {
+                "stdout": "",
+                "stderr": run_error,
+                "returncode": 124,
+                "success": False,
+            }
+
+        # `podman rm` does not reap the exec descendants that coreutils
+        # `timeout` moved into their own process group: under `--pid host` they
+        # are reparented to the host subreaper and outlive the container, where
+        # they keep driving the model server and starve later tasks. Prove this
+        # attempt's tree is gone before any artifact is read.
+        reap_error = ""
+        try:
+            await self._reap_nested_agent_run(session_id)
+        except RuntimeError as exc:
+            # Raising here would skip the backend's workspace collection and
+            # destroy this task's evidence, which is the failure mode being
+            # fixed. Report it as a hard task error instead of suppressing it.
+            reap_error = str(exc)
+
+        if not run_timed_out and self._inner_run_timed_out(
+            await environment.read_file(_RUN_STATUS_FILE)
+        ):
+            run_timed_out = True
+            run_error = (
+                f"openclaw agent exceeded its {inner_timeout}s task budget "
+                "and was terminated"
+            )
+
         output_content = (
             await environment.read_file("/tmp/openclaw_output.txt") or result["stdout"]
         )
@@ -1327,10 +1620,11 @@ class OpenClawAgent(ContainerAgent):
         await self._sync_workspace_to_output(environment, AGENT_WORKSPACE)
 
         return {
-            "success": result["success"],
+            "success": result["success"] and not run_timed_out and not reap_error,
             "output": output_content,
-            "error": result.get("stderr", ""),
+            "error": reap_error or run_error or result.get("stderr", ""),
             "returncode": result["returncode"],
+            "timed_out": run_timed_out,
             "session_data": "",
             "metrics": {
                 "execution_time": 0,
@@ -1487,12 +1781,19 @@ done
 
     async def teardown(self, environment: BaseEnvironment) -> None:
         agent_id = self._agent_id()
+        # Backstop for the paths that never reach the reap in run() (setup
+        # failures, exceptions between the exec and the reap). A leaked run tree
+        # outlives its container and starves later tasks, so it must not depend
+        # on run() completing.
+        if self._run_session_id is not None:
+            await self._reap_nested_agent_run(self._run_session_id)
         # Each task owns an ephemeral container; deleting the agent through the
         # CLI can block behind the live gateway.  Stop only this task's gateway
         # and let container removal discard its private agent configuration.
         await self._kill_gateway(environment)
         await environment.execute_command(
-            "rm -f /tmp/openclaw_output.txt /tmp/patch_openclaw.py",
+            "rm -f /tmp/openclaw_output.txt /tmp/patch_openclaw.py "
+            f"{_RUN_STATUS_FILE}",
             timeout=_OPENCLAW_CONTROL_TIMEOUT,
         )
 
