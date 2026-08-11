@@ -123,9 +123,28 @@ def _check_empty_transcript(exec_r, notes, transcript_text, stderr):
 
 def _check_short_transcript(exec_r, notes, transcript_text, stderr):
     tlen = exec_r.get("transcript_length", 0)
-    if 0 < tlen < 5:
-        return f"Very short transcript ({tlen} entries) — agent may have crashed immediately after starting"
-    return None
+    if not 0 < tlen < 5:
+        return None
+
+    # Brevity alone is not an infrastructure failure. A complete short
+    # exchange is normal for one-action PawBench tasks (for example:
+    # user -> assistant tool call -> tool result -> final assistant). Only
+    # flag a short transcript when its conversational envelope is incomplete.
+    transcript = exec_r.get("transcript") or []
+    roles = [
+        event.get("message", {}).get("role")
+        for event in transcript
+        if isinstance(event, dict) and isinstance(event.get("message"), dict)
+    ]
+    if (
+        exec_r.get("status") == "success"
+        and roles
+        and roles[0] == "user"
+        and roles[-1] == "assistant"
+        and transcript_text.strip()
+    ):
+        return None
+    return f"Very short incomplete transcript ({tlen} entries) — agent may have crashed immediately after starting"
 
 
 def _check_quick_exit(exec_r, notes, transcript_text, stderr):

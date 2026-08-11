@@ -71,7 +71,12 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV COPAW_RUNNING_IN_CONTAINER=1
 
 # ── qwenpaw agent ─────────────────────────────────────────────────────────────
-RUN pip install --no-cache-dir "qwenpaw==${QWENPAW_VERSION}"
+# QwenPaw 1.1.3 imports SetSessionModelResponse, which was removed from ACP
+# 0.12.0.  Keep both packages locked so a fresh rebuild cannot silently resolve
+# an incompatible ACP release.
+COPY docker/qwenpaw-runtime.lock /tmp/qwenpaw-runtime.lock
+RUN test "$(sed -n 's/^qwenpaw==//p' /tmp/qwenpaw-runtime.lock)" = "${QWENPAW_VERSION}" && \
+    pip install --no-cache-dir -r /tmp/qwenpaw-runtime.lock
 
 # ── Common Python packages used across QwenClawBench tasks ────────────────────
 # Pre-installing these avoids per-task pip install waits and network failures.
@@ -116,6 +121,7 @@ ENV PYTHONPATH=/opt/copawbench
 RUN ossutil --version
 RUN cd /opt/copawbench && python3 -c "import pawbench; print('pawbench runner OK')"
 RUN qwenpaw --version 2>/dev/null || echo "qwenpaw ${QWENPAW_VERSION} installed"
+RUN python3 -c "from importlib.metadata import version; assert version('qwenpaw') == '${QWENPAW_VERSION}'; assert version('agent-client-protocol') == '0.10.1'; from acp import SetSessionModelResponse; print('QWENPAW_RUNTIME_COMPAT_OK')"
 RUN node --version && npm --version
 RUN python3 -c "import requests, yaml, pandas, numpy; print('Python deps OK')"
 RUN chromium --version 2>/dev/null || chromium-browser --version 2>/dev/null || echo "[warn] chromium not found"
