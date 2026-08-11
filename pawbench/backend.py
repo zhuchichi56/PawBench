@@ -48,7 +48,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .agents.factory import AgentFactory
 from .grader import grade_task
@@ -56,6 +56,15 @@ from .task_loader import TaskLoader
 from .utils.anomalies import detect_anomalies
 
 WORKSPACE_ROOT = "/app/working/workspaces/default"
+# Ceiling for everything before the agent runs: container start, file staging,
+# image install, gateway startup, and the wait behind the agent's own setup
+# semaphore. Sized from the measured worst case rather than guessed — one
+# OpenClaw setup takes ~250s end to end (the gateway needs ~105s of that before
+# it can answer a WebSocket connect), and at harness concurrency 32 with
+# PAWBENCH_OPENCLAW_SETUP_CONCURRENCY=4 the last task in line waits about
+# (31/4)*250 + 250 ≈ 2190s. This bound exists to catch a wedged setup, never to
+# cut short a task that is merely queued behind other setups.
+_SETUP_HARD_LIMIT_S = 3600
 
 
 @dataclass
@@ -204,15 +213,23 @@ class PawBenchBackend(BenchmarkBackend):
         agent = AgentFactory.create(agent_config)
         hard_limit = scaled_task_timeout + 600
         t0_outer = time.time()
+        phase: dict[str, str] = {"name": "setup"}
         try:
             return asyncio.run(
-                asyncio.wait_for(
-                    self._run_agent_async(task, agent, agent_config),
-                    timeout=hard_limit,
+                self._run_with_phase_limits(
+                    task, agent, agent_config,
+                    setup_limit=_SETUP_HARD_LIMIT_S,
+                    run_limit=hard_limit,
+                    phase=phase,
                 )
             )
         except (asyncio.TimeoutError, TimeoutError):
             elapsed = time.time() - t0_outer
+            expired = (
+                f"setup did not finish within {_SETUP_HARD_LIMIT_S}s"
+                if phase["name"] == "setup"
+                else f"Task exceeded hard wall-clock limit of {hard_limit}s"
+            )
             return TaskResult(
                 task_id=task.task_id,
                 task_name=getattr(task, "name", task.task_id),
@@ -221,8 +238,57 @@ class PawBenchBackend(BenchmarkBackend):
                 execution_time=elapsed,
                 status="error", usage={}, transcript_length=0,
                 timed_out=True,
-                error=f"Task exceeded hard wall-clock limit of {hard_limit}s",
+                error=expired,
             )
+
+    async def _run_with_phase_limits(
+        self,
+        task: Any,
+        agent: Any,
+        agent_config: dict[str, Any],
+        *,
+        setup_limit: int,
+        run_limit: int,
+        phase: dict[str, str],
+    ) -> TaskResult:
+        """Bound setup and the graded run under separate deadlines.
+
+        One ``wait_for`` around the whole coroutine charged container start,
+        image install, gateway startup and the wait behind
+        ``PAWBENCH_OPENCLAW_SETUP_CONCURRENCY`` to the task's own budget. At
+        harness concurrency 32 that cancelled tasks before their agent had run
+        at all, producing ``timed_out=true`` rows with ``transcript_length=0``
+        and no workspace. The task budget now starts when setup returns.
+        """
+        deadline = time.monotonic() + setup_limit
+
+        def arm_run_deadline() -> None:
+            nonlocal deadline
+            phase["name"] = "run"
+            deadline = time.monotonic() + run_limit
+
+        future = asyncio.ensure_future(
+            self._run_agent_async(
+                task, agent, agent_config, arm_run_deadline=arm_run_deadline
+            )
+        )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Re-check periodically: arm_run_deadline() moves the deadline
+            # forward from inside the awaited coroutine.
+            done, _ = await asyncio.wait({future}, timeout=min(remaining, 5.0))
+            if done:
+                return future.result()
+        future.cancel()
+        try:
+            await future
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        raise asyncio.TimeoutError
 
 
     # ── unified docker-agent execution ────────────────────────────────────────
@@ -232,6 +298,8 @@ class PawBenchBackend(BenchmarkBackend):
         task: Any,
         agent: Any,
         agent_config: dict[str, Any],
+        *,
+        arm_run_deadline: Callable[[], None] | None = None,
     ) -> TaskResult:
         """Generic async runner: stage files → setup → run → collect → grade.
 
@@ -305,6 +373,9 @@ class PawBenchBackend(BenchmarkBackend):
             )
 
             await agent.setup(env)
+            # Setup is done: the task's own wall-clock budget starts here.
+            if arm_run_deadline is not None:
+                arm_run_deadline()
             run_result = await agent.run(task.prompt, env)
             stdout_output = run_result.get("output", "")
             exit_ok = run_result.get("success", False)
@@ -372,17 +443,31 @@ class PawBenchBackend(BenchmarkBackend):
                 timed_out=False, error=f"{exc}\nTraceback:\n{full_tb}",
             )
         finally:
+            # A cancellation from the outer hard limit is a BaseException, so a
+            # plain `except Exception` here let it escape `agent.teardown` and
+            # skip `env.stop()` entirely. Cleanup failures were also swallowed
+            # silently, which is how a run reached 51 live containers at
+            # concurrency 32: every leaked container starves the rest of the run
+            # and there was nothing in the log to show it had happened.
+            cleanup_errors: list[str] = []
             try:
                 await agent.teardown(env)
-            except Exception:
-                pass
+            except BaseException as exc:  # noqa: BLE001 - cleanup must continue
+                cleanup_errors.append(f"agent.teardown: {exc}")
             docker_images_save_dir = agent_config.get("docker_images_save_dir")
             if not _use_local and docker_images_save_dir and getattr(env, "container_id", None):
                 _save_docker_image(container_name, task.task_id, Path(docker_images_save_dir))
             try:
                 await env.stop()
-            except Exception:
-                pass
+            except BaseException as exc:  # noqa: BLE001 - reported, never hidden
+                cleanup_errors.append(f"env.stop: {exc}")
+            if cleanup_errors:
+                print(
+                    f"[backend] CLEANUP FAILED container={container_name} "
+                    f"task={task.task_id}: {'; '.join(cleanup_errors)}",
+                    flush=True,
+                )
+                run_error = "; ".join(filter(None, [run_error, *cleanup_errors]))
 
         transcript = agent.extract_transcript(local_workspace, stdout_output)
 

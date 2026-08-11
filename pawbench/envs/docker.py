@@ -13,6 +13,12 @@ from pawbench.envs.base import BaseEnvironment
 
 _NESTED_PODMAN_LIFECYCLE_LOCK = threading.Lock()
 _NESTED_PODMAN_COMMAND_TIMEOUT = 60
+# Abandoning a start attempt costs one task; abandoning a teardown leaks a
+# container for the rest of the run, so cleanup is allowed to queue much longer
+# on the shared lifecycle lock than a start is. Observed at harness concurrency
+# 32: every lifecycle operation serialises through this lock, and a 60s budget
+# left containers behind while `except Exception: pass` hid the failure.
+_NESTED_PODMAN_CLEANUP_LOCK_TIMEOUT = 900
 
 
 class DockerEnvironment(BaseEnvironment):
@@ -50,9 +56,9 @@ class DockerEnvironment(BaseEnvironment):
         self._is_running = False
 
     @staticmethod
-    def _lifecycle_lock_acquire(nested: bool) -> None:
+    def _lifecycle_lock_acquire(nested: bool, *, timeout: int | None = None) -> None:
         if nested and not _NESTED_PODMAN_LIFECYCLE_LOCK.acquire(
-            timeout=_NESTED_PODMAN_COMMAND_TIMEOUT
+            timeout=timeout if timeout is not None else _NESTED_PODMAN_COMMAND_TIMEOUT
         ):
             raise RuntimeError("Timed out waiting for nested Podman lifecycle lock")
 
@@ -189,7 +195,9 @@ class DockerEnvironment(BaseEnvironment):
 
     def _stop_sync(self) -> None:
         nested = os.environ.get("PAWBENCH_PODMAN_NESTED") == "1"
-        self._lifecycle_lock_acquire(nested)
+        self._lifecycle_lock_acquire(
+            nested, timeout=_NESTED_PODMAN_CLEANUP_LOCK_TIMEOUT
+        )
         try:
             errors, remaining = self._cleanup_container_record_sync(
                 self.name, nested=nested, graceful=True

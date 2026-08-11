@@ -31,6 +31,49 @@ _OPENCLAW_CONTROL_TIMEOUT = 60
 _INNER_RUN_KILL_GRACE_S = 10
 _RUN_REAP_GRACE_S = 5
 _RUN_STATUS_FILE = "/tmp/openclaw_run_status.txt"
+# The gateway binds its TCP listener ~90s before it can answer an agent's
+# WebSocket connect: it logs "ready (N plugins)" and then spends the whole
+# "starting channels and sidecars" phase unable to complete a handshake
+# (measured on this image: TCP open at 15.3s, first HTTP 101 at 105.4s, of
+# which 61s are two doomed 30s model-pricing fetches — the container has no
+# internet egress). A TCP-only probe therefore hands the agent a gateway that
+# rejects it, and the lost time is charged to the task's own budget.
+_GATEWAY_READY_TIMEOUT_S = 240
+_GATEWAY_READY_PROBE = r'''
+import socket, sys, time
+
+port = int(sys.argv[1])
+deadline = time.time() + float(sys.argv[2])
+request = (
+    "GET / HTTP/1.1\r\n"
+    "Host: 127.0.0.1:%d\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    "\r\n"
+) % port
+
+last = "no attempt"
+while time.time() < deadline:
+    sock = socket.socket()
+    sock.settimeout(2.0)
+    try:
+        sock.connect(("127.0.0.1", port))
+        sock.sendall(request.encode())
+        status = sock.recv(64).split(b"\r\n")[0].decode("ascii", "replace")
+        if " 101" in status:
+            print("GATEWAY_READY")
+            sys.exit(0)
+        last = status or "closed without a response"
+    except Exception as exc:
+        last = "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        sock.close()
+    time.sleep(0.5)
+print("GATEWAY_NOT_READY last=%s" % last)
+sys.exit(1)
+'''
 _OPENCLAW_SETUP_SEMAPHORE: threading.BoundedSemaphore | None = None
 _OPENCLAW_SETUP_LOCK = threading.Lock()
 _OPENCLAW_SETUP_LIMIT: int | None = None
@@ -858,21 +901,20 @@ class OpenClawAgent(ContainerAgent):
     async def _wait_gateway_ready(
         self, environment: BaseEnvironment, *, port: int | None = None
     ) -> None:
+        """Block until the gateway can actually complete a WebSocket connect.
+
+        An open TCP port is not readiness: the listener is bound long before the
+        channel/sidecar phase finishes, and an agent that connects during that
+        window gets ``[ws] handshake timeout`` followed by ``code=1008 reason=
+        connect failed``. Requiring an HTTP ``101`` keeps that startup cost in
+        setup, where it belongs, instead of silently eating the task's budget.
+        """
         port = self._gateway_port if port is None else port
-        wait_cmd = (
-            f'python3 -c "'
-            "import socket, time; "
-            f"deadline=time.time()+45; ok=False\n"
-            "while time.time()<deadline:\n"
-            f"  s=socket.socket(); s.settimeout(0.3)\n"
-            f"  try: s.connect(('127.0.0.1',{port})); ok=True; break\n"
-            f"  except Exception: time.sleep(0.3)\n"
-            f"  finally:\n"
-            f"    try: s.close()\n"
-            f"    except Exception: pass\n"
-            "print('GATEWAY_READY' if ok else 'GATEWAY_NOT_READY')\""
+        probe = shlex.quote(_GATEWAY_READY_PROBE)
+        result = await environment.execute_command(
+            f"python3 -c {probe} {port} {_GATEWAY_READY_TIMEOUT_S}",
+            timeout=_GATEWAY_READY_TIMEOUT_S + _OPENCLAW_CONTROL_TIMEOUT,
         )
-        result = await environment.execute_command(wait_cmd, timeout=_OPENCLAW_CONTROL_TIMEOUT)
         if result.get("returncode", 1) != 0 or "GATEWAY_READY" not in (
             result.get("stdout") or ""
         ):
