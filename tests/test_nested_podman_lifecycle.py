@@ -135,3 +135,36 @@ def test_cleanup_verification_command_failure_is_not_clean(monkeypatch):
         assert "verification-error" in str(exc)
     else:
         raise AssertionError("failed cleanup verification was accepted")
+
+
+def test_nested_exec_uses_in_container_process_group_timeout(monkeypatch):
+    monkeypatch.setenv("PAWBENCH_PODMAN_NESTED", "1")
+    env = DockerEnvironment(name="exec-timeout", image="test")
+    env.container_id = "id"
+    captured = []
+
+    class Process:
+        returncode = 124
+
+        async def communicate(self):
+            return b"", b""
+
+        def kill(self):
+            raise AssertionError("client kill should not be needed")
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create(*command, **kwargs):
+        captured.extend(command)
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    try:
+        asyncio.run(env.execute_command("sleep 60", timeout=1))
+    except TimeoutError as exc:
+        assert "sleep 60" in str(exc)
+    else:
+        raise AssertionError("coreutils timeout exit was accepted")
+    assert captured[:3] == ["docker", "exec", "exec-timeout"]
+    assert captured[3:7] == ["timeout", "--kill-after=5s", "1s", "bash"]

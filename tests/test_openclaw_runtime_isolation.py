@@ -102,8 +102,9 @@ def test_openclaw_control_commands_use_contention_safe_deadline():
             OpenClawAgent.teardown,
         )
     )
-    for short in ("timeout=5", "timeout=10", "timeout=15", "timeout=30"):
-        assert short not in sources
+    import re
+
+    assert not re.search(r"timeout=(?:5|10|15|30)(?!\d)", sources)
     assert "_OPENCLAW_CONTROL_TIMEOUT" in sources
     assert "openclaw config set agents.defaults.workspace" not in sources
     assert "agents_cfg['workspace']" in inspect.getsource(

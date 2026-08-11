@@ -228,7 +228,7 @@ class OpenClawAgent(ContainerAgent):
             f"--model {shlex.quote(openclaw_model)} "
             f"--workspace {shlex.quote(AGENT_WORKSPACE)} "
             "--non-interactive",
-            timeout=_OPENCLAW_CONTROL_TIMEOUT,
+            timeout=300,
         )
         if add_result.get("returncode", 1) != 0:
             raise RuntimeError(

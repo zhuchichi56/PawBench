@@ -210,31 +210,53 @@ class DockerEnvironment(BaseEnvironment):
             return
         await self._await_lifecycle_thread(self._stop_sync)
 
-    async def execute_command(self, command: str, timeout: Optional[int] = None) -> Dict[str, Any]:
-        """Execute a command in the Docker container.
+    def _docker_exec_command(
+        self, command: str, *, wait_timeout: int, nested: bool
+    ) -> list[str]:
+        if nested:
+            # Coreutils timeout creates a separate foreground process group and
+            # terminates it inside the shared PID namespace. This prevents a
+            # timed-out `podman exec` client from leaving `openclaw agents add`
+            # or another helper alive to block container removal.
+            return [
+                "docker",
+                "exec",
+                self.name,
+                "timeout",
+                "--kill-after=5s",
+                f"{wait_timeout}s",
+                "bash",
+                "-c",
+                command,
+            ]
+        return ["docker", "exec", self.name, "bash", "-c", command]
 
-        Args:
-            command: The command to execute
-            timeout: Optional timeout in seconds
-
-        Returns:
-            Dictionary containing the execution result
-        """
+    async def execute_command(
+        self, command: str, timeout: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Execute a command in the container with nested-process closure."""
         if not self.container_id:
             raise RuntimeError("Container not started")
 
-        # Use bash -c to properly handle shell commands with quotes, pipes, etc.
-        cmd = ["docker", "exec", self.name, "bash", "-c", command]
+        wait_timeout = timeout if timeout else 600
+        nested = os.environ.get("PAWBENCH_PODMAN_NESTED") == "1"
+        cmd = self._docker_exec_command(
+            command, wait_timeout=wait_timeout, nested=nested
+        )
+        # The in-container timeout owns command/process-group termination. The
+        # client gets a short grace period to flush stdout and reap the exec.
+        client_timeout = wait_timeout + 15 if nested else wait_timeout
 
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
             try:
-                wait_timeout = timeout if timeout else 600
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=wait_timeout)
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=client_timeout
+                )
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
@@ -243,20 +265,27 @@ class DockerEnvironment(BaseEnvironment):
                     f"Command timed out after {wait_timeout} seconds: {snippet}"
                 )
 
+            stdout_text = stdout.decode(errors="replace") if stdout else ""
+            stderr_text = stderr.decode(errors="replace") if stderr else ""
+            if nested and process.returncode in (124, 137):
+                snippet = command if len(command) <= 500 else command[:500] + "..."
+                raise TimeoutError(
+                    f"Command timed out after {wait_timeout} seconds: {snippet}"
+                )
             return {
-                "stdout": stdout.decode(errors="replace") if stdout else "",
-                "stderr": stderr.decode(errors="replace") if stderr else "",
+                "stdout": stdout_text,
+                "stderr": stderr_text,
                 "returncode": process.returncode,
-                "success": process.returncode == 0
+                "success": process.returncode == 0,
             }
-        except TimeoutError:
+        except (TimeoutError, asyncio.CancelledError):
             raise
-        except Exception as e:
+        except Exception as exc:
             return {
                 "stdout": "",
-                "stderr": str(e),
+                "stderr": str(exc),
                 "returncode": -1,
-                "success": False
+                "success": False,
             }
 
     async def copy_to(self, source: Path, destination: str) -> bool:
