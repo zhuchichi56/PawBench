@@ -2,6 +2,7 @@
 """Docker environment implementation for OpenJudge agent evaluation framework."""
 
 import asyncio
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -49,6 +50,11 @@ class DockerEnvironment(BaseEnvironment):
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
 
         cmd = ["docker", "run", "-d", "--name", self.name]
+        # Nested rootless Podman cannot mount a private procfs or create slirp
+        # networking on these AMLT nodes.  Host PID/network namespaces are the
+        # verified compatibility route; harness agents use per-task ports/PIDs.
+        if os.environ.get("PAWBENCH_PODMAN_NESTED") == "1":
+            cmd.extend(["--network", "host", "--pid", "host"])
 
         # Add volume mounts
         for host_path, container_path in self.volumes.items():

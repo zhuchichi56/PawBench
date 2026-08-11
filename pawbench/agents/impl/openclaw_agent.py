@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """OpenClaw agent implementation for pawbench evaluation."""
 
+import asyncio
+import itertools
 import json
 import os
 import shlex
@@ -14,6 +16,38 @@ from pawbench.llm.model_config import get_model_config, ProviderType
 
 
 _GATEWAY_PORT = 18789
+_OPENCLAW_PORTS = itertools.count(28088)
+_OPENCLAW_SETUP_LIMIT_ENV = "PAWBENCH_OPENCLAW_SETUP_CONCURRENCY"
+_OPENCLAW_SETUP_LIMIT_DEFAULT = 8
+_OPENCLAW_SETUP_SEMAPHORE: asyncio.Semaphore | None = None
+_OPENCLAW_SETUP_LOOP: asyncio.AbstractEventLoop | None = None
+_OPENCLAW_SETUP_LIMIT: int | None = None
+
+
+def _get_openclaw_setup_semaphore() -> asyncio.Semaphore:
+    """Return the process-local limiter for container and gateway setup only."""
+    global _OPENCLAW_SETUP_LIMIT, _OPENCLAW_SETUP_LOOP, _OPENCLAW_SETUP_SEMAPHORE
+
+    raw_limit = os.environ.get(
+        _OPENCLAW_SETUP_LIMIT_ENV, str(_OPENCLAW_SETUP_LIMIT_DEFAULT)
+    )
+    try:
+        limit = int(raw_limit)
+    except ValueError as exc:
+        raise ValueError(f"{_OPENCLAW_SETUP_LIMIT_ENV} must be an integer") from exc
+    if limit < 1:
+        raise ValueError(f"{_OPENCLAW_SETUP_LIMIT_ENV} must be positive")
+
+    loop = asyncio.get_running_loop()
+    if (
+        _OPENCLAW_SETUP_SEMAPHORE is None
+        or _OPENCLAW_SETUP_LOOP is not loop
+        or _OPENCLAW_SETUP_LIMIT != limit
+    ):
+        _OPENCLAW_SETUP_SEMAPHORE = asyncio.Semaphore(limit)
+        _OPENCLAW_SETUP_LOOP = loop
+        _OPENCLAW_SETUP_LIMIT = limit
+    return _OPENCLAW_SETUP_SEMAPHORE
 
 
 class OpenClawAgent(ContainerAgent):
@@ -26,12 +60,13 @@ class OpenClawAgent(ContainerAgent):
 
     def __init__(self, name: str = "openclaw", **kwargs: Any):
         super().__init__(name, **kwargs)
+        self._gateway_port = next(_OPENCLAW_PORTS)
 
     def _agent_id(self) -> str:
-        """Return a stable, filesystem-safe openclaw agent ID for this run."""
+        """Return a task-unique, filesystem-safe OpenClaw agent ID."""
         model = self.config.get("model", "dashscope/qwen3.6-plus")
-        slug = model.replace("/", "-").replace(".", "-").lower()
-        return f"bench-{slug}"
+        slug = model.replace("/", "-").replace(".", "-").lower()[:36]
+        return f"bench-{slug}-{self._gateway_port}"
 
     def _openclaw_model_id(self, model_identifier: str) -> str:
         """Translate a pawbench model identifier to an openclaw model identifier.
@@ -100,6 +135,13 @@ class OpenClawAgent(ContainerAgent):
     # ── setup ─────────────────────────────────────────────────────────────────
 
     async def setup(self, environment: BaseEnvironment) -> None:
+        # Limit only environment/CLI/gateway initialization.  The permit is
+        # released before run(), so ready tasks and model requests retain the
+        # benchmark's full harness queue width.
+        async with _get_openclaw_setup_semaphore():
+            await self._setup_limited(environment)
+
+    async def _setup_limited(self, environment: BaseEnvironment) -> None:
         await self.install(environment)
 
         # Create workspace and openclaw state directories.
@@ -158,21 +200,13 @@ class OpenClawAgent(ContainerAgent):
         # config writes; start exactly once after all patches are on disk.
         await self._kill_gateway(environment)
 
-        # Create (or recreate) the named bench agent so its workspace and
-        # model are explicitly bound.  Deleting first guarantees no stale
-        # config from a previous run leaks into the new task.
+        # Each benchmark attempt owns an ephemeral container plus a unique
+        # agent/config identity.  There is therefore no stale agent to delete;
+        # invoking ``agents delete`` in a fresh container can block behind
+        # OpenClaw plugin initialization and caused queue-wide setup timeouts.
         agent_id = self._agent_id()
         openclaw_model = self._openclaw_model_id(model_identifier)
         env_prefix = self._make_key_env(provider_str, api_key)
-        # NOTE: The first openclaw CLI invocation in a fresh container installs
-        # all plugin runtime dependencies (can take 60-120 s on slow networks).
-        # Timeouts here must exceed that warm-up cost; subsequent invocations
-        # reuse the cached deps and complete in < 1 s.
-        await environment.execute_command(
-            f"{env_prefix}"
-            f"openclaw agents delete {shlex.quote(agent_id)} --force 2>/dev/null || true",
-            timeout=300,
-        )
         add_result = await environment.execute_command(
             f"{env_prefix}"
             f"openclaw agents add {shlex.quote(agent_id)} "
@@ -209,6 +243,10 @@ class OpenClawAgent(ContainerAgent):
                 }
             },
         }, indent=2)
+        await environment.execute_command(
+            f"mkdir -p /root/.openclaw/agents/{agent_id_lower}/agent",
+            timeout=10,
+        )
         await environment.write_file(
             f"/root/.openclaw/agents/{agent_id_lower}/agent/auth-profiles.json",
             auth_profiles_content,
@@ -234,6 +272,7 @@ class OpenClawAgent(ContainerAgent):
             "p = '/root/.openclaw/openclaw.json'\n"
             "d = json.load(open(p)) if os.path.exists(p) else {}\n"
             "d.setdefault('gateway', {})['mode'] = 'local'\n"
+            f"d['gateway']['port'] = {self._gateway_port}\n"
             "json.dump(d, open(p, 'w'), indent=2)\n"
             "print('gateway.mode ensured')\n",
         )
@@ -312,15 +351,14 @@ class OpenClawAgent(ContainerAgent):
         """Stop any gateway process so config writes do not trigger hot-reload races."""
         await environment.execute_command(
             "kill -9 $(cat /tmp/openclaw_gateway.pid 2>/dev/null) 2>/dev/null || true; "
-            "pkill -9 -f 'openclaw gateway' 2>/dev/null || true; "
-            "pkill -9 -f 'openclaw-gateway' 2>/dev/null || true; "
             "sleep 0.5; true",
             timeout=10,
         )
 
     async def _wait_gateway_ready(
-        self, environment: BaseEnvironment, *, port: int = _GATEWAY_PORT
+        self, environment: BaseEnvironment, *, port: int | None = None
     ) -> None:
+        port = self._gateway_port if port is None else port
         wait_cmd = (
             f'python3 -c "'
             "import socket, time; "
@@ -346,11 +384,11 @@ class OpenClawAgent(ContainerAgent):
         await environment.execute_command(
             self._make_key_env(provider_str, api_key)
             + "export OPENCLAW_DISABLE_BONJOUR=1 && "
-            "nohup openclaw gateway >/tmp/openclaw_gateway.log 2>&1 & "
+            f"nohup openclaw gateway --port {self._gateway_port} >/tmp/openclaw_gateway.log 2>&1 & "
             "echo $! >/tmp/openclaw_gateway.pid || true",
             timeout=10,
         )
-        await self._wait_gateway_ready(environment)
+        await self._wait_gateway_ready(environment, port=self._gateway_port)
 
     async def _configure_openclaw_json(
         self,
@@ -562,7 +600,9 @@ class OpenClawAgent(ContainerAgent):
                 # openclaw gateway refuses to start if gateway.mode is absent.
                 # agents add may drop this field when rewriting openclaw.json;
                 # ensure it is always present after our patch.
-                + "d.setdefault('gateway', {}).setdefault('mode', 'local')\n"
+                + "gateway_cfg = d.setdefault('gateway', {})\n"
+                + "gateway_cfg.setdefault('mode', 'local')\n"
+                + f"gateway_cfg['port'] = {self._gateway_port}\n"
                 # ── agents.defaults ───────────────────────────────────────
                 + "agents_cfg = d.setdefault('agents', {}).setdefault('defaults', {})\n"
                 f"agents_cfg['model'] = {{'primary': {json.dumps(primary)}}}\n"
@@ -692,7 +732,7 @@ class OpenClawAgent(ContainerAgent):
         )
 
     async def _ensure_gateway(self, environment: BaseEnvironment, *, api_key: str = "", provider_str: str = "openai") -> None:
-        port = _GATEWAY_PORT
+        port = self._gateway_port
 
         # TCP-based liveness check: verify the gateway port is actually accepting
         # connections, not just that a process with the saved PID exists.
@@ -738,8 +778,8 @@ class OpenClawAgent(ContainerAgent):
           requests (~15 s after the log line ``ready``).
         """
         await environment.execute_command(
-            "pkill -9 -f 'openclaw gateway' 2>/dev/null; "
-            "pkill -9 -f 'openclaw-gateway' 2>/dev/null; "
+            "gateway_pid=$(cat /tmp/openclaw_gateway.pid 2>/dev/null || true); "
+            "[ -z \"$gateway_pid\" ] || kill -9 \"$gateway_pid\" 2>/dev/null || true; "
             "sleep 1; true",
             timeout=10,
         )
@@ -752,7 +792,7 @@ class OpenClawAgent(ContainerAgent):
             self._make_key_env(provider_str_strict, api_key)
             + "export OPENCLAW_DISABLE_BONJOUR=1 && "
             "rm -f /tmp/openclaw_gateway.log && "
-            "nohup openclaw gateway >/tmp/openclaw_gateway.log 2>&1 & "
+            f"nohup openclaw gateway --port {self._gateway_port} >/tmp/openclaw_gateway.log 2>&1 & "
             "echo $! >/tmp/openclaw_gateway.pid || true",
             timeout=10,
         )
@@ -856,8 +896,9 @@ class OpenClawAgent(ContainerAgent):
         openclaw_model = self._openclaw_model_id(model_identifier)
         env_prefix = self._make_key_env(provider_str, api_key)
         check_result = await environment.execute_command(
-            f"{env_prefix}openclaw agents list 2>&1 || true",
-            timeout=30,
+            f"test -f /root/.openclaw/agents/{agent_id_lower}/agent/auth-profiles.json "
+            f"&& echo {shlex.quote(agent_id)} || true",
+            timeout=10,
         )
         check_output = (check_result.get("stdout") or "") + (check_result.get("stderr") or "")
         if agent_id.lower() not in check_output.lower():
@@ -896,6 +937,7 @@ class OpenClawAgent(ContainerAgent):
                 "p = '/root/.openclaw/openclaw.json'\n"
                 "d = json.load(open(p)) if os.path.exists(p) else {}\n"
                 "d.setdefault('gateway', {})['mode'] = 'local'\n"
+            f"d['gateway']['port'] = {self._gateway_port}\n"
                 "json.dump(d, open(p, 'w'), indent=2)\n"
                 "print('gateway.mode ensured')\n",
             )
@@ -1146,10 +1188,10 @@ done
 
     async def teardown(self, environment: BaseEnvironment) -> None:
         agent_id = self._agent_id()
-        await environment.execute_command(
-            f"openclaw agents delete {shlex.quote(agent_id)} --force 2>/dev/null || true",
-            timeout=60,
-        )
+        # Each task owns an ephemeral container; deleting the agent through the
+        # CLI can block behind the live gateway.  Stop only this task's gateway
+        # and let container removal discard its private agent configuration.
+        await self._kill_gateway(environment)
         await environment.execute_command(
             "rm -f /tmp/openclaw_output.txt /tmp/patch_openclaw.py",
             timeout=10,

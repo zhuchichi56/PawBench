@@ -2,6 +2,7 @@
 """QwenPaw agent — installs and drives the qwenpaw HTTP server inside a Docker container."""
 
 import json
+import itertools
 import os
 import time
 from typing import Any, Dict
@@ -15,6 +16,7 @@ from pawbench.llm.model_config import get_model_config, ProviderType
 _WORKING_DIR = "/app/working"
 _SECRET_DIR = "/app/working.secret"
 _SERVER_URL = "http://127.0.0.1:8088"
+_QWENPAW_PORTS = itertools.count(18088)
 
 # Default qwenpaw package version to install when the binary is absent from
 # the image.  Override per-task via agent config key "qwenpaw_version".
@@ -58,6 +60,8 @@ class QwenPawAgent(ContainerAgent):
         self._base_url: str = ""
         self._generate_kwargs: Dict[str, Any] = {}
         self._qwenpaw_version: str = _DEFAULT_QWENPAW_VERSION
+        self._server_port = next(_QWENPAW_PORTS)
+        self._server_url = f"http://127.0.0.1:{self._server_port}"
 
     # ── config ────────────────────────────────────────────────────────────────
 
@@ -327,7 +331,7 @@ except Exception:
     pass  # monkey-patch is optional; skip if qwenpaw internals changed
 
 # ── start qwenpaw app ──────────────────────────────────────────────────────
-sys.argv = ["qwenpaw", "app", "--host", "127.0.0.1", "--port", "8088"]
+sys.argv = ["qwenpaw", "app", "--host", "127.0.0.1", "--port", "__QWENPAW_PORT__"]
 from qwenpaw.__main__ import cli  # noqa: E402
 
 cli()
@@ -338,7 +342,7 @@ cli()
         api_key = self._api_key
         base_url = self._base_url
         # Write the startup script (with image base64 monkey-patch) to the container.
-        await environment.write_file("/tmp/qwenpaw_start.py", self._QWENPAW_START_SCRIPT)
+        await environment.write_file("/tmp/qwenpaw_start.py", self._QWENPAW_START_SCRIPT.replace("__QWENPAW_PORT__", str(self._server_port)))
         server_cmd = (
             f"export OPENAI_API_KEY='{api_key}' && "
             f"export OPENAI_BASE_URL='{base_url}' && "
@@ -355,11 +359,11 @@ cli()
             "echo $! > /tmp/qwenpaw_server.pid && "
             # Use /api/version (same as setup_provider._detect_api_base) for readiness.
             "for i in $(seq 1 60); do "
-            f"  curl -sf {_SERVER_URL}/api/version >/dev/null 2>&1 && "
+            f"  curl -sf {self._server_url}/api/version >/dev/null 2>&1 && "
             "    echo '[qwenpaw-server] ready' && break; "
             "  sleep 1; "
             "done; "
-            f"curl -sf {_SERVER_URL}/api/version >/dev/null 2>&1 || "
+            f"curl -sf {self._server_url}/api/version >/dev/null 2>&1 || "
             "  echo '[qwenpaw-server] WARNING: server may not be ready'"
         )
         await environment.execute_command(server_cmd, timeout=90)
@@ -472,7 +476,7 @@ cli()
             "instruction = open('/tmp/task_instruction.txt', encoding='utf-8').read().strip()\n"
             f"SESSION_ID   = {repr(session_id)}\n"
             "USER_ID      = 'default'\n"
-            f"URL          = {repr(_SERVER_URL)}\n"
+            f"URL          = {repr(self._server_url)}\n"
             f"API_BASE     = URL + '/api'\n"
             f"SESSIONS_DIR = {repr(sessions_dir)}\n"
             f"PROVIDER_ID  = {repr(provider_id)}\n"
