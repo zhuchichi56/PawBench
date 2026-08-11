@@ -106,6 +106,31 @@ class DockerEnvironment(BaseEnvironment):
             )
         except subprocess.TimeoutExpired:
             pass
+
+        # Rootless Podman 3.4 can leave a fully stopped shared-PID container in
+        # the transient removing state after rm times out. Its exact cleanup
+        # command clears only that container's stale runtime/storage record;
+        # never use a system-wide prune/reset here.
+        try:
+            subprocess.run(
+                ["docker", "container", "cleanup", "--rm", self.name],
+                capture_output=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            exists = subprocess.run(
+                ["docker", "container", "exists", self.name],
+                capture_output=True,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Timed out verifying container cleanup: {self.name}"
+            ) from exc
+        if exists.returncode == 0:
+            raise RuntimeError(f"Container cleanup incomplete: {self.name}")
         self._is_running = False
         self.container_id = None
 
