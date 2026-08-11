@@ -1,0 +1,15 @@
+# Rebuild the PawBench adapter on restricted AMLT nodes where nested Podman
+# cannot execute a fresh RUN layer (the outer container forbids mounting /proc).
+# The base tag is produced by docker/Dockerfile.pawbench-qwenpaw at commit
+# d9ab96df490e8f1ca97e533a4057fee6985fb420 and must be preflighted against
+# image ID 366d146858ef86166032817905b27e8a982a16c2d07043a4d9b832074c98e676.
+ARG BASE_IMAGE=localhost/qwenclawbench-qwenpaw:1.1.3-acp0.10.1-d9ab96d
+FROM ${BASE_IMAGE}
+
+ARG PAWBENCH_SOURCE_COMMIT=unknown
+LABEL org.opencontainers.image.revision=${PAWBENCH_SOURCE_COMMIT}
+
+# Only this runtime file changed after the locked base image was built.
+# Keep the full canonical Dockerfile as the clean-host rebuild authority.
+COPY pawbench/agents/impl/qwenpaw_agent.py \
+     /opt/copawbench/pawbench/agents/impl/qwenpaw_agent.py
