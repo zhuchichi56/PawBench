@@ -19,6 +19,7 @@ _SERVER_URL = "http://127.0.0.1:8088"
 # Default qwenpaw package version to install when the binary is absent from
 # the image.  Override per-task via agent config key "qwenpaw_version".
 _DEFAULT_QWENPAW_VERSION = "1.1.3"
+_REQUIRED_ACP_VERSION = "0.10.1"
 
 # Map our ProviderType to qwenpaw's builtin provider IDs and chat_model values.
 # Builtin providers are pre-registered in qwenpaw; only api_key / model need to
@@ -95,7 +96,10 @@ class QwenPawAgent(ContainerAgent):
 
     async def install(self, environment: BaseEnvironment) -> None:
         want_ver = self._qwenpaw_version
-        pkg_spec = f"qwenpaw=={want_ver}"
+        pkg_specs = (
+            f"qwenpaw=={want_ver}",
+            f"agent-client-protocol=={_REQUIRED_ACP_VERSION}",
+        )
 
         check = await environment.execute_command(
             "command -v qwenpaw || command -v copaw",
@@ -121,10 +125,34 @@ class QwenPawAgent(ContainerAgent):
             timeout=120,
         )
         await environment.execute_command(
-            f"pip install '{pkg_spec}' --quiet 2>&1 | tail -5",
+            "pip install --quiet "
+            + " ".join(f"'{spec}'" for spec in pkg_specs)
+            + " 2>&1 | tail -5",
             timeout=600,
         )
         await self._ensure_copaw_alias(environment)
+
+    async def _assert_runtime_compatibility(self, environment: BaseEnvironment) -> None:
+        """Fail before server startup when QwenPaw and ACP are incompatible."""
+        script = (
+            "from importlib.metadata import version; "
+            f"assert version('qwenpaw') == '{self._qwenpaw_version}'; "
+            f"assert version('agent-client-protocol') == '{_REQUIRED_ACP_VERSION}'; "
+            "from acp import SetSessionModelResponse; "
+            "print('QWENPAW_RUNTIME_COMPAT_OK')"
+        )
+        check = await environment.execute_command(
+            f"python3 -c {json.dumps(script)}",
+            timeout=15,
+        )
+        if check.get("returncode", 1) != 0:
+            detail = (check.get("stderr") or check.get("stdout") or "unknown error").strip()
+            raise RuntimeError(
+                "QwenPaw runtime compatibility check failed: expected "
+                f"qwenpaw=={self._qwenpaw_version}, "
+                f"agent-client-protocol=={_REQUIRED_ACP_VERSION}, and "
+                f"acp.SetSessionModelResponse importable; detail={detail}"
+            )
 
     async def _ensure_copaw_alias(self, environment: BaseEnvironment) -> None:
         """Create /usr/local/bin/copaw → qwenpaw shim if not already present."""
@@ -147,6 +175,7 @@ class QwenPawAgent(ContainerAgent):
         """
         self._compute_config()
         await self.install(environment)
+        await self._assert_runtime_compatibility(environment)
         await self._patch_agentscope(environment)
         await self._wipe_sessions(environment)
 
