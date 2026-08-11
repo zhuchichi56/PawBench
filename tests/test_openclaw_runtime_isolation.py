@@ -1,5 +1,7 @@
 import asyncio
 import inspect
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -44,6 +46,35 @@ def test_setup_limiter_caps_only_setup(monkeypatch):
 
     asyncio.run(exercise())
     assert maximum == 8
+
+
+def test_setup_limiter_is_shared_across_runner_threads(monkeypatch):
+    monkeypatch.setenv("PAWBENCH_OPENCLAW_SETUP_CONCURRENCY", "4")
+    monkeypatch.setattr(openclaw_agent, "_OPENCLAW_SETUP_SEMAPHORE", None)
+    monkeypatch.setattr(openclaw_agent, "_OPENCLAW_SETUP_LIMIT", None)
+    active = 0
+    maximum = 0
+    counter_lock = threading.Lock()
+
+    async def fake_setup_limited(self, environment):
+        nonlocal active, maximum
+        with counter_lock:
+            active += 1
+            maximum = max(maximum, active)
+        await asyncio.sleep(0.03)
+        with counter_lock:
+            active -= 1
+
+    monkeypatch.setattr(OpenClawAgent, "_setup_limited", fake_setup_limited)
+
+    def run_one(_index):
+        agent = OpenClawAgent(model="custom/Qwen3.5-4B")
+        asyncio.run(agent.setup(None))
+
+    with ThreadPoolExecutor(max_workers=24) as pool:
+        list(pool.map(run_one, range(24)))
+
+    assert maximum == 4
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "not-an-int"])

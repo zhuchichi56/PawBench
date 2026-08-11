@@ -8,6 +8,7 @@ import os
 import shlex
 import signal
 import socket
+import threading
 import time
 from typing import Any, Dict, List
 
@@ -23,14 +24,20 @@ _GATEWAY_PORT = 18789
 _OPENCLAW_PORTS = itertools.count(28088, 20)
 _OPENCLAW_SETUP_LIMIT_ENV = "PAWBENCH_OPENCLAW_SETUP_CONCURRENCY"
 _OPENCLAW_SETUP_LIMIT_DEFAULT = 8
-_OPENCLAW_SETUP_SEMAPHORE: asyncio.Semaphore | None = None
-_OPENCLAW_SETUP_LOOP: asyncio.AbstractEventLoop | None = None
+_OPENCLAW_SETUP_SEMAPHORE: threading.BoundedSemaphore | None = None
+_OPENCLAW_SETUP_LOCK = threading.Lock()
 _OPENCLAW_SETUP_LIMIT: int | None = None
 
 
-def _get_openclaw_setup_semaphore() -> asyncio.Semaphore:
-    """Return the process-local limiter for container and gateway setup only."""
-    global _OPENCLAW_SETUP_LIMIT, _OPENCLAW_SETUP_LOOP, _OPENCLAW_SETUP_SEMAPHORE
+def _get_openclaw_setup_semaphore() -> threading.BoundedSemaphore:
+    """Return one thread-shared limiter for OpenClaw setup.
+
+    BenchmarkRunner executes each task through asyncio.run in a worker thread,
+    so an asyncio.Semaphore is loop-local and cannot cap setup across
+    concurrent tasks. A process-wide threading semaphore enforces the
+    configured limit across all runner threads and event loops.
+    """
+    global _OPENCLAW_SETUP_LIMIT, _OPENCLAW_SETUP_SEMAPHORE
 
     raw_limit = os.environ.get(
         _OPENCLAW_SETUP_LIMIT_ENV, str(_OPENCLAW_SETUP_LIMIT_DEFAULT)
@@ -42,16 +49,12 @@ def _get_openclaw_setup_semaphore() -> asyncio.Semaphore:
     if limit < 1:
         raise ValueError(f"{_OPENCLAW_SETUP_LIMIT_ENV} must be positive")
 
-    loop = asyncio.get_running_loop()
-    if (
-        _OPENCLAW_SETUP_SEMAPHORE is None
-        or _OPENCLAW_SETUP_LOOP is not loop
-        or _OPENCLAW_SETUP_LIMIT != limit
-    ):
-        _OPENCLAW_SETUP_SEMAPHORE = asyncio.Semaphore(limit)
-        _OPENCLAW_SETUP_LOOP = loop
-        _OPENCLAW_SETUP_LIMIT = limit
-    return _OPENCLAW_SETUP_SEMAPHORE
+    with _OPENCLAW_SETUP_LOCK:
+        if _OPENCLAW_SETUP_SEMAPHORE is None or _OPENCLAW_SETUP_LIMIT != limit:
+            _OPENCLAW_SETUP_SEMAPHORE = threading.BoundedSemaphore(limit)
+            _OPENCLAW_SETUP_LIMIT = limit
+        return _OPENCLAW_SETUP_SEMAPHORE
+
 
 
 class OpenClawAgent(ContainerAgent):
@@ -140,11 +143,16 @@ class OpenClawAgent(ContainerAgent):
     # ── setup ─────────────────────────────────────────────────────────────────
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        # Limit only environment/CLI/gateway initialization.  The permit is
-        # released before run(), so ready tasks and model requests retain the
+        # BenchmarkRunner gives every task its own event loop in a worker
+        # thread. Acquire the process-wide threading semaphore without blocking
+        # this loop, then release before run() so model requests retain the
         # benchmark's full harness queue width.
-        async with _get_openclaw_setup_semaphore():
+        limiter = _get_openclaw_setup_semaphore()
+        await asyncio.to_thread(limiter.acquire)
+        try:
             await self._setup_limited(environment)
+        finally:
+            limiter.release()
 
     async def _setup_limited(self, environment: BaseEnvironment) -> None:
         await self.install(environment)
