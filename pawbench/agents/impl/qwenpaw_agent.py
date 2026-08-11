@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """QwenPaw agent — installs and drives the qwenpaw HTTP server inside a Docker container."""
 
+import fcntl
 import json
 import os
+from pathlib import Path
+import socket
+import tempfile
 import time
-from typing import Any, Dict
+from typing import Any, Dict, IO
 
 from pawbench.agents.base import ContainerAgent
 from pawbench.agents.constants import AGENT_WORKSPACE
@@ -14,7 +18,10 @@ from pawbench.llm.model_config import get_model_config, ProviderType
 
 _WORKING_DIR = "/app/working"
 _SECRET_DIR = "/app/working.secret"
-_SERVER_URL = "http://127.0.0.1:8088"
+_SERVER_HOST = "127.0.0.1"
+_SERVER_PORT_START = 18088
+_SERVER_PORT_END = 18287
+_PORT_LOCK_DIR = Path(tempfile.gettempdir()) / "pawbench-qwenpaw-ports"
 
 # Default qwenpaw package version to install when the binary is absent from
 # the image.  Override per-task via agent config key "qwenpaw_version".
@@ -59,6 +66,52 @@ class QwenPawAgent(ContainerAgent):
         self._base_url: str = ""
         self._generate_kwargs: Dict[str, Any] = {}
         self._qwenpaw_version: str = _DEFAULT_QWENPAW_VERSION
+        self._server_port: int | None = None
+        self._server_url: str | None = None
+        self._port_lock_file: IO[str] | None = None
+
+    def _allocate_server_port(self) -> int:
+        """Reserve one host-network port across concurrent PawBench workers."""
+        if self._server_port is not None:
+            return self._server_port
+        _PORT_LOCK_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for port in range(_SERVER_PORT_START, _SERVER_PORT_END + 1):
+            lock_path = _PORT_LOCK_DIR / f"{port}.lock"
+            lock_file = lock_path.open("a+", encoding="utf-8")
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock_file.close()
+                continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind((_SERVER_HOST, port))
+            except OSError:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
+                continue
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(f"pid={os.getpid()} port={port}\n")
+            lock_file.flush()
+            self._port_lock_file = lock_file
+            self._server_port = port
+            self._server_url = f"http://{_SERVER_HOST}:{port}"
+            return port
+        raise RuntimeError(
+            f"No free QwenPaw server port in {_SERVER_PORT_START}-{_SERVER_PORT_END}"
+        )
+
+    def _release_server_port(self) -> None:
+        lock_file = self._port_lock_file
+        self._port_lock_file = None
+        self._server_port = None
+        self._server_url = None
+        if lock_file is not None:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
 
     # ── config ────────────────────────────────────────────────────────────────
 
@@ -179,6 +232,7 @@ class QwenPawAgent(ContainerAgent):
         await self._patch_agentscope(environment)
         await self._wipe_sessions(environment)
 
+        self._allocate_server_port()
         await self._start_xvfb(environment)
         await self._start_server(environment)
 
@@ -356,18 +410,24 @@ except Exception:
     pass  # monkey-patch is optional; skip if qwenpaw internals changed
 
 # ── start qwenpaw app ──────────────────────────────────────────────────────
-sys.argv = ["qwenpaw", "app", "--host", "127.0.0.1", "--port", "8088"]
+sys.argv = ["qwenpaw", "app", "--host", "127.0.0.1", "--port", "__QWENPAW_SERVER_PORT__"]
 from qwenpaw.__main__ import cli  # noqa: E402
 
 cli()
 """
 
     async def _start_server(self, environment: BaseEnvironment) -> None:
-        """Start the qwenpaw HTTP server (127.0.0.1:8088) and wait until ready."""
+        """Start this task's qwenpaw HTTP server on its reserved host port."""
+        if self._server_port is None or self._server_url is None:
+            raise RuntimeError("QwenPaw server port was not allocated")
         api_key = self._api_key
         base_url = self._base_url
+        server_url = self._server_url
+        startup_script = self._QWENPAW_START_SCRIPT.replace(
+            "__QWENPAW_SERVER_PORT__", str(self._server_port)
+        )
         # Write the startup script (with image base64 monkey-patch) to the container.
-        await environment.write_file("/tmp/qwenpaw_start.py", self._QWENPAW_START_SCRIPT)
+        await environment.write_file("/tmp/qwenpaw_start.py", startup_script)
         server_cmd = (
             f"export OPENAI_API_KEY='{api_key}' && "
             f"export OPENAI_BASE_URL='{base_url}' && "
@@ -384,14 +444,18 @@ cli()
             "echo $! > /tmp/qwenpaw_server.pid && "
             # Use /api/version (same as setup_provider._detect_api_base) for readiness.
             "for i in $(seq 1 60); do "
-            f"  curl -sf {_SERVER_URL}/api/version >/dev/null 2>&1 && "
+            f"  curl -sf {server_url}/api/version >/dev/null 2>&1 && "
             "    echo '[qwenpaw-server] ready' && break; "
             "  sleep 1; "
             "done; "
-            f"curl -sf {_SERVER_URL}/api/version >/dev/null 2>&1 || "
-            "  echo '[qwenpaw-server] WARNING: server may not be ready'"
+            f"curl -sf {server_url}/api/version >/dev/null 2>&1"
         )
-        await environment.execute_command(server_cmd, timeout=90)
+        result = await environment.execute_command(server_cmd, timeout=90)
+        if result.get("returncode", 1) != 0:
+            detail = (result.get("stderr") or result.get("stdout") or "unknown error").strip()
+            raise RuntimeError(
+                f"QwenPaw server failed readiness at {server_url}: {detail}"
+            )
 
     # ── run ───────────────────────────────────────────────────────────────────
 
@@ -495,13 +559,17 @@ cli()
         sessions_dir = f"{_WORKING_DIR}/workspaces/default/sessions"
         inner_timeout = int(self.config.get("task_timeout_s") or 1800)
 
+        if self._server_url is None:
+            raise RuntimeError("QwenPaw server URL is unavailable")
+        server_url = self._server_url
+
         return (
             "import json, os, sys, time, requests\n"
             "\n"
             "instruction = open('/tmp/task_instruction.txt', encoding='utf-8').read().strip()\n"
             f"SESSION_ID   = {repr(session_id)}\n"
             "USER_ID      = 'default'\n"
-            f"URL          = {repr(_SERVER_URL)}\n"
+            f"URL          = {repr(server_url)}\n"
             f"API_BASE     = URL + '/api'\n"
             f"SESSIONS_DIR = {repr(sessions_dir)}\n"
             f"PROVIDER_ID  = {repr(provider_id)}\n"
@@ -788,11 +856,19 @@ __PYEOF__
     # ── teardown ──────────────────────────────────────────────────────────────
 
     async def teardown(self, environment: BaseEnvironment) -> None:
-        await environment.execute_command(
-            "rm -f /tmp/qwenpaw_output.txt /tmp/call_agent.py "
-            "/tmp/task_instruction.txt",
-            timeout=10,
-        )
+        try:
+            await environment.execute_command(
+                "server_pid=$(cat /tmp/qwenpaw_server.pid 2>/dev/null || true); "
+                "if [ -n \"$server_pid\" ]; then "
+                "  pkill -KILL -P \"$server_pid\" 2>/dev/null || true; "
+                "  kill -9 \"$server_pid\" 2>/dev/null || true; "
+                "fi; "
+                "rm -f /tmp/qwenpaw_output.txt /tmp/call_agent.py "
+                "/tmp/task_instruction.txt /tmp/qwenpaw_server.pid",
+                timeout=10,
+            )
+        finally:
+            self._release_server_port()
 
     @property
     def version(self) -> str:
