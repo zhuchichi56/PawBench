@@ -88,10 +88,24 @@ class DockerEnvironment(BaseEnvironment):
         """
         if not self.container_id:
             return
-        # Short grace period so a frozen container doesn't stall cleanup.
-        subprocess.run(["docker", "stop", "-t", "5", self.name], capture_output=True)
-        # Force-remove regardless of whether stop succeeded.
-        subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
+        # Bound both cleanup calls.  Nested rootless Podman can otherwise wait
+        # forever after a shared-PID-namespace container has already exited.
+        try:
+            subprocess.run(
+                ["docker", "stop", "-t", "5", self.name],
+                capture_output=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", self.name],
+                capture_output=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            pass
         self._is_running = False
         self.container_id = None
 

@@ -858,10 +858,17 @@ class OpenClawAgent(ContainerAgent):
             "print('SESSION_NOT_READY')\n"
         )
         await environment.write_file("/tmp/wait_openclaw_session.py", wait_script)
-        await environment.execute_command(
-            "python3 /tmp/wait_openclaw_session.py",
-            timeout=15,
-        )
+        try:
+            await environment.execute_command(
+                "python3 /tmp/wait_openclaw_session.py",
+                timeout=15,
+            )
+        except TimeoutError:
+            # This poll is explicitly best-effort.  A slow container exec must
+            # not erase an otherwise completed task; post_run_collect() still
+            # copies any session artifacts that are available, and the canary
+            # rejects an empty transcript before a full run can start.
+            return
 
     # ── run ───────────────────────────────────────────────────────────────────
 

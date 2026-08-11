@@ -55,3 +55,20 @@ def test_setup_limiter_rejects_invalid_values(monkeypatch, value):
 
     with pytest.raises(ValueError):
         asyncio.run(exercise())
+
+
+def test_session_flush_timeout_is_best_effort(monkeypatch):
+    agent = OpenClawAgent(model="custom/Qwen3.5-4B")
+
+    class Environment:
+        async def write_file(self, path, content):
+            return True
+
+        async def execute_command(self, command, timeout=None):
+            raise TimeoutError("slow exec")
+
+    asyncio.run(
+        agent._wait_for_session_flush(
+            Environment(), agent_id_lower=agent._agent_id().lower()
+        )
+    )
